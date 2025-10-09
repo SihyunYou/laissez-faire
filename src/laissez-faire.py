@@ -180,11 +180,11 @@ class UpbitTickSystem:
     
     @staticmethod
     def is_excluded_tick_range(price):
-        if 100 <= price < 360:
+        if 100 <= price < 270:
             return True
-        if 10.0 <= price < 36.0:
+        if 10.0 <= price < 27.0:
             return True
-        if price < 3.60:
+        if price < 2.70:
             return True
         return False
 
@@ -1476,7 +1476,8 @@ if __name__=="__main__":
 
                 # Confidence 기반 분할 매수 적용
                 drop_count = max(base_drop_count, int(base_drop_count * (2.0 - confidence) * 1.2))
-                
+                distribution_type = BuyOrder.DistributionType.LINEAR if confidence > 0.8 else BuyOrder.DistributionType.LOG_LINEAR_I if confidence < 0.3 else BuyOrder.DistributionType.LOG_LINEAR_II
+
                 print_log(LogLevel.INFO, 
                          f"Market Analysis - RSI: {analyzer.get_rsi():.2f}, "
                          f"Volatility: {analyzer.volatility_ratio:.4f}, Confidence: {confidence:.2f}, "
