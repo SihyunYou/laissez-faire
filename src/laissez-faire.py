@@ -27,7 +27,7 @@ init(autoreset=True)
 
 # Configuration
 UNIT = 5
-SLEEP_TIME = 0.01
+SLEEP_TIME = 0.00
 EXCEPTION_SLEEP_TIME = 0.25
 CANDLE_URL = "https://api.upbit.com/v1/candles/minutes/" + str(UNIT)
 TICKER_URL = "https://api.upbit.com/v1/ticker"
@@ -431,7 +431,7 @@ class DynamicBuyOrder:
         self.last_check_time = None
         self.initial_volume = 0.0
         self.first_order_start_time = None  # 첫 번째 주문 시작 시간
-        self.first_order_timeout = 30  # 첫 번째 주문 30초 타임아웃
+        self.first_order_timeout = 10  # 첫 번째 주문 30초 타임아웃
         
     class DistributionType(Enum):
         LINEAR = 1
