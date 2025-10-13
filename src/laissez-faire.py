@@ -863,8 +863,9 @@ class TradingManager:
         self.buy_order_start_time = None
         self.buy_timeout_seconds = 60  # 1분 타임아웃
         self.last_command_check = None
-        self.command_check_interval = 5  # 5초마다 command.txt 체크
+        self.command_check_interval = 2  # 2초로 단축 (기존 5초)
         self.forced_symbol_change = False
+        self.command_symbol_override = None  # 새로운 필드: command.txt에서 지정된 심볼
         
     def set_symbol(self, symbol):
         """심볼 설정 및 캐시"""
@@ -874,10 +875,17 @@ class TradingManager:
         self.symbol_cache_time = datetime.now()
         symbol_cache_time = self.symbol_cache_time
         self.start_time = datetime.now()
-        print_log(LogLevel.INFO, f"Trading symbol set to: {symbol} (cached for 1 hour)")
+        print_log(LogLevel.INFO, f"Trading symbol set to: {symbol}")
         
     def get_cached_symbol(self):
-        """캐시된 심볼 반환"""
+        """캐시된 심볼 반환 - command 오버라이드 우선"""
+        # command 오버라이드가 있으면 즉시 반영
+        if self.command_symbol_override:
+            symbol_to_use = self.command_symbol_override
+            self.command_symbol_override = None  # 적용 후 초기화
+            self.set_symbol(symbol_to_use)
+            return symbol_to_use
+            
         global current_trading_symbol, symbol_cache_time
         
         if (current_trading_symbol and symbol_cache_time and
@@ -888,7 +896,7 @@ class TradingManager:
         return None
         
     def check_command_file(self):
-        """command.txt 파일 변경 체크 및 심볼 변경 처리"""
+        """command.txt 파일 변경 체크 및 심볼 변경 처리 - 강화된 로직"""
         current_time = datetime.now()
         
         if (self.last_command_check and 
@@ -906,19 +914,22 @@ class TradingManager:
                     if parts[0] == 'SYMBOL' and len(parts) > 1:
                         new_symbol = parts[1]
                         
-                        # 현재 심볼과 다르고, 거래가 활성화 상태가 아닐 때만 변경
-                        if (new_symbol != self.current_symbol and 
-                            not self.buy_orders_placed and 
-                            not self.buy_orders_executed):
-                            
+                        # 현재 심볼과 다를 경우 즉시 변경
+                        if new_symbol != self.current_symbol:
                             # 변동성 보호 체크
                             if VolatilityProtector.check_volatility_protection(new_symbol):
                                 print_log(LogLevel.WARNING, f"Command symbol {new_symbol} blocked by volatility protection")
                                 return False
                                 
                             print_log(LogLevel.INFO, f"Command file changed symbol to: {new_symbol}")
-                            self.set_symbol(new_symbol)
+                            self.command_symbol_override = new_symbol  # 오버라이드 저장
                             self.forced_symbol_change = True
+                            
+                            # 현재 거래 중이면 주문 취소
+                            if self.buy_orders_placed or self.buy_orders_executed:
+                                print_log(LogLevel.WARNING, "Cancelling current orders due to symbol change")
+                                OrderCanceler().cancel_all_orders(3)  # 모든 주문 취소
+                            
                             return True
                             
                     elif parts[0] == 'EXIT':
@@ -931,13 +942,22 @@ class TradingManager:
             
         return False
 
+    def apply_command_symbol_override(self):
+        """command.txt에서 지정된 심볼을 적용"""
+        if self.command_symbol_override:
+            symbol_to_use = self.command_symbol_override
+            self.command_symbol_override = None  # 적용 후 초기화
+            self.set_symbol(symbol_to_use)
+            return symbol_to_use
+        return None
+
     def should_process_command_change(self):
-        """command 변경을 처리할 수 있는 상태인지 확인"""
-        # 거래가 완전히 대기 상태일 때만 command 변경 처리
+        """command 변경을 처리할 수 있는 상태인지 확인 - 완화된 조건"""
+        # 거래가 완전히 대기 상태이거나, 강제 변경 요청이 있을 때 처리
         return (not self.buy_orders_placed and 
                 not self.buy_orders_executed and 
                 not self.sell_orders_placed and 
-                not self.sell_orders_executed)
+                not self.sell_orders_executed) or self.forced_symbol_change
         
     def mark_buy_orders_placed(self):
         """매수 주문 걸림 표시"""
@@ -1799,7 +1819,7 @@ if __name__=="__main__":
         drop_percentage = args.drop_percentage if args.drop_percentage else 0.3
         distribution_type = args.distribution_type if args.distribution_type else DynamicBuyOrder.DistributionType.LOG_LINEAR_II
         distribution_weight = args.weight if args.weight else 0.04
-        profit_percentage = args.profit_percentage if args.profit_percentage else 0.4
+        profit_percentage = args.profit_percentage if args.profit_percentage else 0.35
 
         InitialBalance = S = AccountChecker().get_krw_balance()
         print_log(LogLevel.INFO, f"Available KRW: {int(S):,}")
@@ -1826,11 +1846,11 @@ if __name__=="__main__":
             cached_symbol = trading_manager.get_cached_symbol()
             if cached_symbol:
                 symbol = cached_symbol
-                print_log(LogLevel.INFO, f"Using cached symbol: {symbol}")
+                print_log(LogLevel.INFO, f"Using symbol: {symbol}")
                 
                 # 캐시된 심볼에 대해 변동성 보호 체크
                 if VolatilityProtector.check_volatility_protection(symbol):
-                    print_log(LogLevel.WARNING, f"Cached symbol {symbol} blocked by volatility protection - clearing cache")
+                    print_log(LogLevel.WARNING, f"Symbol {symbol} blocked by volatility protection - clearing cache")
                     trading_manager.reset()
                     current_trading_symbol = None
                     symbol_cache_time = None
@@ -1897,14 +1917,21 @@ if __name__=="__main__":
 
             # 매수 프로세스 시작 전 command 변경 체크
             if trading_manager.should_place_buy_orders():
-                # 매수 시작 전 한 번 더 command 체크
+                # 매수 시작 전 command 체크 (더 자주 체크)
                 if trading_manager.check_command_file():
                     print_log(LogLevel.INFO, "Symbol changed before buying, restarting cycle")
                     continue
                     
+                # command 오버라이드가 있으면 즉시 적용
+                if trading_manager.command_symbol_override:
+                    symbol = trading_manager.apply_command_symbol_override()
+                    print_log(LogLevel.INFO, f"Applied command override symbol: {symbol}")
+                    analyzer = MarketAnalyzer(symbol)
+                    confidence = analyzer.calculate_composite_confidence()
+                    
                 analyzer = MarketAnalyzer(symbol)
                 base_drop_count = 18
-                drop_count = max(base_drop_count, int(base_drop_count * (2.0 - confidence) * 1.0))
+                drop_count = max(base_drop_count, int(base_drop_count * (2.0 - confidence) * 1.2))
 
                 print_log(LogLevel.INFO, 
                          f"Market Analysis - RSI: {analyzer.get_rsi():.2f}, "
