@@ -26,7 +26,7 @@ import random
 init(autoreset=True)
 
 # Configuration
-UNIT = 5
+UNIT = 1
 SLEEP_TIME = 0.00
 EXCEPTION_SLEEP_TIME = 0.25
 CANDLE_URL = "https://api.upbit.com/v1/candles/minutes/" + str(UNIT)
@@ -414,25 +414,33 @@ class AccountChecker:
         return -1, -1, -1
 
 class DynamicBuyOrder:
-    """동적 분할 매수 주문 관리 클래스 - 체결 시에만 다음 주문 추가"""
+    """동적 분할 매수 주문 관리 클래스 - 체결된 주문 취소 문제 해결"""
     
     def __init__(self, symbol, current_price, total_amount, weight, exclude_count=0):
         self.symbol = symbol
+        self.original_price = current_price
         self.current_price = current_price
         self.total_amount = total_amount
         self.weight = weight
         self.exclude_count = exclude_count
-        self.last_order_time = None
-        self.planned_orders = []
-        self.executed_orders = []
-        self.pending_orders = []  # 미체결 주문 목록
-        self.next_order_index = 0
-        self.is_active = False
-        self.last_check_time = None
-        self.initial_volume = 0.0
-        self.first_order_start_time = None  # 첫 번째 주문 시작 시간
-        self.first_order_timeout = 10  # 첫 번째 주문 30초 타임아웃
         
+        # 상태 관리
+        self.is_active = False
+        self.last_order_time = None
+        self.last_check_time = None
+        self.first_order_start_time = None
+        self.first_order_timeout = 7
+        
+        # 계획 관리
+        self.original_planned_orders = []
+        self.active_planned_orders = []
+        self.executed_orders = []
+        self.pending_orders = []
+        
+        # 밀림 관리
+        self.plan_shift_amount = 0.0
+        self.last_shift_check_price = current_price
+
     class DistributionType(Enum):
         LINEAR = 1
         LOG_LINEAR_II = 2
@@ -446,305 +454,403 @@ class DynamicBuyOrder:
         """주문 계획 계산"""
         print_log(LogLevel.INFO, f"Starting order plan calculation for {self.symbol}")
         
-        if self.DistributionType.LINEAR == distribution_type:
-            self.linear_distribution_plan(drop_percentage, drop_count, 16777216)
-        elif self.DistributionType.LOG_LINEAR_II == distribution_type:
-            self.log_linear_distribution_plan(drop_percentage, drop_count, 3)
-        elif self.DistributionType.LOG_LINEAR_I == distribution_type:
-            self.log_linear_distribution_plan(drop_percentage, drop_count, 2)
-        elif self.DistributionType.PARABOLIC_II == distribution_type:
-            self.parabolic_distribution2_plan(drop_percentage, drop_count)
-        elif self.DistributionType.PARABOLIC_I == distribution_type:
-            self.parabolic_distribution_plan(drop_percentage, drop_count)
-        elif self.DistributionType.EXPONENTIAL == distribution_type:
-            self.exponential_distribution_plan(drop_percentage, drop_count, 1.2)
-        elif self.DistributionType.FIBONACCI == distribution_type:
-            self.fibonacci_distribution_plan(drop_percentage, drop_count)
+        self.original_planned_orders = []
+        self.active_planned_orders = []
+        
+        if distribution_type == self.DistributionType.LINEAR:
+            self._calculate_linear_plan(drop_percentage, drop_count)
+        elif distribution_type == self.DistributionType.LOG_LINEAR_II:
+            self._calculate_log_linear_plan(drop_percentage, drop_count, 3)
+        elif distribution_type == self.DistributionType.LOG_LINEAR_I:
+            self._calculate_log_linear_plan(drop_percentage, drop_count, 2)
+        elif distribution_type == self.DistributionType.PARABOLIC_II:
+            self._calculate_parabolic2_plan(drop_percentage, drop_count)
+        elif distribution_type == self.DistributionType.PARABOLIC_I:
+            self._calculate_parabolic_plan(drop_percentage, drop_count)
+        elif distribution_type == self.DistributionType.EXPONENTIAL:
+            self._calculate_exponential_plan(drop_percentage, drop_count, 1.2)
+        elif distribution_type == self.DistributionType.FIBONACCI:
+            self._calculate_fibonacci_plan(drop_percentage, drop_count)
         else:
-            self.linear_distribution_plan(drop_percentage, drop_count, 16777216)
-            
-        print_log(LogLevel.SUCCESS, f"Calculated {len(self.planned_orders)} buy orders for {self.symbol}")
+            self._calculate_linear_plan(drop_percentage, drop_count)
+        
+        self.original_planned_orders = [order.copy() for order in self.active_planned_orders]
+        print_log(LogLevel.SUCCESS, f"Calculated {len(self.active_planned_orders)} buy orders for {self.symbol}")
 
-    def linear_distribution_plan(self, drop_percentage, drop_count, difference):
-        total_weight = 0
-        for n in range(1, drop_count + 1):
-            total_weight += n
-    
-        for n in range(1, drop_count + 1 - self.exclude_count):
-            height_weight = 1 + self.weight * (n - 1)
-            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.current_price), 
-                                                     (n - 1) * (drop_percentage * height_weight))
-            quantity = self.total_amount * n / total_weight
-            
-            self.planned_orders.append({
-                'level': n,
-                'planned_price': planned_price,
-                'quantity': quantity,
-                'volume': quantity / planned_price,
-                'executed': False
-            })
-
-    def log_linear_distribution_plan(self, drop_percentage, drop_count, weight):
-        total_weight = 0
-        for n in range(1, drop_count + 1):
-            total_weight += n * math.log(n + weight)
+    def _calculate_linear_plan(self, drop_percentage, drop_count):
+        total_weight = sum(range(1, drop_count + 1))
         
         for n in range(1, drop_count + 1 - self.exclude_count):
             height_weight = 1 + self.weight * (n - 1)
-            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.current_price), 
-                                                     (n - 1) * (drop_percentage * height_weight))
-            quantity = self.total_amount * (n * math.log(n + weight)) / total_weight
+            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.original_price), (n - 1) * (drop_percentage * height_weight))
+            quantity = self.total_amount * n / total_weight
             
-            self.planned_orders.append({
+            self.active_planned_orders.append({
                 'level': n,
+                'original_planned_price': planned_price,
                 'planned_price': planned_price,
                 'quantity': quantity,
                 'volume': quantity / planned_price,
-                'executed': False
+                'executed': False,
+                'shift_applied': 0.0
             })
 
-    def parabolic_distribution_plan(self, drop_percentage, drop_count):
-        total_weight = drop_count * (pow(drop_count, 2) + 5) / 6
+    def _calculate_log_linear_plan(self, drop_percentage, drop_count, weight):
+        total_weight = sum(n * math.log(n + weight) for n in range(1, drop_count + 1))
+        
         for n in range(1, drop_count + 1 - self.exclude_count):
             height_weight = 1 + self.weight * (n - 1)
-            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.current_price), 
-                                                     (n - 1) * (drop_percentage * height_weight))
+            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.original_price), (n - 1) * (drop_percentage * height_weight))
+            quantity = self.total_amount * (n * math.log(n + weight)) / total_weight
+            
+            self.active_planned_orders.append({
+                'level': n,
+                'original_planned_price': planned_price,
+                'planned_price': planned_price,
+                'quantity': quantity,
+                'volume': quantity / planned_price,
+                'executed': False,
+                'shift_applied': 0.0
+            })
+
+    def _calculate_parabolic_plan(self, drop_percentage, drop_count):
+        total_weight = drop_count * (pow(drop_count, 2) + 5) / 6
+        
+        for n in range(1, drop_count + 1 - self.exclude_count):
+            height_weight = 1 + self.weight * (n - 1)
+            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.original_price), (n - 1) * (drop_percentage * height_weight))
             weight_factor = (pow(n, 2) / 2) - (n / 2) + 1
             quantity = self.total_amount * weight_factor / total_weight
             
-            self.planned_orders.append({
+            self.active_planned_orders.append({
                 'level': n,
+                'original_planned_price': planned_price,
                 'planned_price': planned_price,
                 'quantity': quantity,
                 'volume': quantity / planned_price,
-                'executed': False
+                'executed': False,
+                'shift_applied': 0.0
             })
 
-    def parabolic_distribution2_plan(self, drop_percentage, drop_count):
+    def _calculate_parabolic2_plan(self, drop_percentage, drop_count):
         total_weight = drop_count * (5 * pow(drop_count, 2) + 15 * drop_count + 40) / 6
+        
         for n in range(1, drop_count + 1 - self.exclude_count):
             height_weight = 1 + self.weight * (n - 1)
-            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.current_price), 
-                                                     (n - 1) * (drop_percentage * height_weight))
+            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.original_price), (n - 1) * (drop_percentage * height_weight))
             weight_factor = 5 / 2 * pow(n, 2) + 5 / 2 * n + 5
             quantity = self.total_amount * weight_factor / total_weight
             
-            self.planned_orders.append({
+            self.active_planned_orders.append({
                 'level': n,
+                'original_planned_price': planned_price,
                 'planned_price': planned_price,
                 'quantity': quantity,
                 'volume': quantity / planned_price,
-                'executed': False
+                'executed': False,
+                'shift_applied': 0.0
             })
 
-    def exponential_distribution_plan(self, drop_percentage, drop_count, exponent):
+    def _calculate_exponential_plan(self, drop_percentage, drop_count, exponent):
         h = drop_count
         r = exponent
         a = self.total_amount * (r - 1) / (pow(r, h) - 1)
 
         for n in range(1, drop_count + 1 - self.exclude_count):
             height_weight = 1 + self.weight * (n - 1)
-            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.current_price), 
-                                                     (n - 1) * (drop_percentage * height_weight))
+            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.original_price), (n - 1) * (drop_percentage * height_weight))
             quantity = a * pow(r, n - 1)
             
-            self.planned_orders.append({
+            self.active_planned_orders.append({
                 'level': n,
+                'original_planned_price': planned_price,
                 'planned_price': planned_price,
                 'quantity': quantity,
                 'volume': quantity / planned_price,
-                'executed': False
+                'executed': False,
+                'shift_applied': 0.0
             })
 
-    def fibonacci_distribution_plan(self, drop_percentage, drop_count):
-        fibonacci = [1, 1, 2, 2, 3, 3, 5, 5, 8, 8, 13, 13, 21, 21, 34, 34, 55, 55, 89, 89, 144, 144, 233, 233, 377, 377, 810, 810, 1187, 1187]
-        my_fibonacci = fibonacci[:drop_count - 1]
+    def _calculate_fibonacci_plan(self, drop_percentage, drop_count):
+        fibonacci = [1, 1, 2, 2, 3, 3, 5, 5, 8, 8, 13, 13, 21, 21, 34, 34, 55, 55, 89, 89, 144, 144, 233, 233, 377, 377, 610, 610, 987, 987]
+        my_fibonacci = fibonacci[:drop_count]
+        total_fibonacci = sum(my_fibonacci)
 
         for n in range(1, drop_count + 1 - self.exclude_count):
             height_weight = 1 + self.weight * (n - 1)
-            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.current_price), 
-                                                     (n - 1) * (drop_percentage * height_weight))
-            quantity = self.total_amount * fibonacci[n - 1] / sum(my_fibonacci)
+            planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(self.original_price), (n - 1) * (drop_percentage * height_weight))
+            quantity = self.total_amount * fibonacci[n - 1] / total_fibonacci
             
-            self.planned_orders.append({
+            self.active_planned_orders.append({
                 'level': n,
+                'original_planned_price': planned_price,
                 'planned_price': planned_price,
                 'quantity': quantity,
                 'volume': quantity / planned_price,
-                'executed': False
+                'executed': False,
+                'shift_applied': 0.0
             })
+
+    def _calculate_required_shift(self, current_price):
+        """필요한 밀림량 계산"""
+        required_shift = 0.0
+        
+        for order in self.active_planned_orders:
+            if not order['executed'] and order['planned_price'] > current_price:
+                gap = order['planned_price'] - current_price
+                if gap > required_shift:
+                    required_shift = gap
+        
+        # 최소 밀림량 체크 (1000원 이상)
+        if required_shift < 1000:
+            return 0.0
+            
+        return required_shift
+
+    def _apply_plan_shift(self, shift_amount):
+        """계획 밀림 적용"""
+        print_log(LogLevel.INFO, f"🔄 Applying plan shift: {shift_amount:,.0f} KRW")
+        
+        # 모든 미체결 주문에 밀림 적용
+        for order in self.active_planned_orders:
+            if not order['executed']:
+                new_original_price = order['original_planned_price'] - shift_amount
+                new_planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(new_original_price), 0)
+                
+                order['planned_price'] = new_planned_price
+                order['shift_applied'] = shift_amount
+                order['volume'] = order['quantity'] / order['planned_price']
+        
+        self.plan_shift_amount = shift_amount
+        print_log(LogLevel.SUCCESS, f"✅ Plan shifted by {shift_amount:,.0f} KRW")
 
     def execute_dynamic_buy_orders(self):
         """동적 매수 시작"""
-        if not self.planned_orders:
+        if not self.active_planned_orders:
             print_log(LogLevel.ERROR, "No planned orders to execute")
             return False
             
         self.is_active = True
-        self.next_order_index = 0
-        self.initial_volume = self._get_current_volume()
+        self.pending_orders.clear()
+        self.plan_shift_amount = 0.0
         self.first_order_start_time = datetime.now()
         
-        print_log(LogLevel.INFO, f"Starting dynamic buying with {len(self.planned_orders)} planned orders")
+        print_log(LogLevel.INFO, f"Starting dynamic buying with {len(self.active_planned_orders)} planned orders")
         
-        # 첫 번째 주문 즉시 실행
-        return self._execute_next_order()
+        # 바로 첫 주문 실행
+        return self._execute_next_available_order()
 
     def check_and_continue(self):
-        """체결 확인 및 다음 주문 실행 - 개선된 로직"""
+        """체결 확인 및 다음 주문 실행"""
         if not self.is_active:
             return False
             
         current_time = datetime.now()
+        
+        # 체크 간격 제한
         if self.last_check_time and (current_time - self.last_check_time).total_seconds() < SLEEP_TIME:
             return False
         self.last_check_time = current_time
         
-        # 첫 번째 주문 타임아웃 체크 (1분)
+        # 현재가 확인
+        current_price = RealMarketData.get_current_price(self.symbol)
+        if not current_price:
+            return False
+            
+        self.current_price = current_price
+        
+        # 계획 밀림 확인
+        self._check_and_apply_plan_shift(current_price)
+        
+        # 첫 주문 타임아웃 체크
         if (self.first_order_start_time and 
             len(self.executed_orders) == 0 and 
             len(self.pending_orders) > 0):
             
             elapsed_seconds = (current_time - self.first_order_start_time).total_seconds()
             if elapsed_seconds > self.first_order_timeout:
-                print_log(LogLevel.WARNING, f"First order timeout after {elapsed_seconds:.0f} seconds - cancelling all orders")
+                print_log(LogLevel.WARNING, f"First order timeout after {elapsed_seconds:.0f} seconds")
                 self.cancel_all_pending_orders()
                 self.is_active = False
                 return False
         
         # 체결 확인
-        executed_before = len(self.executed_orders)
         has_new_execution = self._check_order_execution()
-        executed_after = len(self.executed_orders)
         
-        # 체결된 주문이 있고, 미체결 주문이 없으면 다음 주문 실행
-        if has_new_execution and len(self.pending_orders) == 0:
-            global buy_uuids
-
-            if len(buy_uuids) > 0:
-                buy_uuids.pop(0)
-
-            print_log(LogLevel.SUCCESS, f"Order {executed_after} executed! No pending orders - executing next order...")
-            return self._execute_next_order()
+        # 체결되었거나 대기 주문이 없으면 다음 주문 실행
+        if has_new_execution or len(self.pending_orders) == 0:
+            return self._execute_next_available_order()
         
         return False
 
-    def _check_order_execution(self):
-        """주문 체결 확인 - 강화된 로직"""
-        current_volume = self._get_current_volume()
+    def _check_and_apply_plan_shift(self, current_price):
+        """계획 밀림 확인 및 적용 - 체결된 주문 취소 문제 해결"""
+        required_shift = self._calculate_required_shift(current_price)
         
-        # 보유량이 증가했는지 확인 (더 민감한 임계값)
-        if current_volume > self.initial_volume + 0.0000001:
-            volume_diff = current_volume - self.initial_volume
-            print_log(LogLevel.SUCCESS, f"Volume increased! Before: {self.initial_volume:.6f}, After: {current_volume:.6f}, Diff: {volume_diff:.6f}")
+        if required_shift > 0:
+            # ✅ 체결되지 않은 대기 주문만 취소
+            orders_to_cancel = []
+            for pending_order in self.pending_orders:
+                order_uuid = pending_order.get('uuid')
+                if order_uuid and not self._is_order_executed(pending_order):
+                    orders_to_cancel.append(pending_order)
             
-            # pending_orders에서 체결된 주문 찾기 (뒤에서부터 체크)
-            executed_any = False
-            for i in range(len(self.pending_orders) - 1, -1, -1):
-                pending = self.pending_orders[i]
+            if orders_to_cancel:
+                print_log(LogLevel.INFO, f"Cancelling {len(orders_to_cancel)} pending orders due to plan shift")
+                for pending_order in orders_to_cancel:
+                    order_uuid = pending_order.get('uuid')
+                    if order_uuid:
+                        self._cancel_single_order(order_uuid)
+                        # 글로벌 UUID에서도 제거
+                        global buy_uuids
+                        if order_uuid in buy_uuids:
+                            buy_uuids.remove(order_uuid)
                 
-                # 이미 executed_orders에 있는지 확인
-                already_executed = any(executed['level'] == pending['level'] 
-                                     for executed in self.executed_orders)
-                
-                if not already_executed:
-                    # 이 주문이 체결되었다고 처리
-                    current_price = RealMarketData.get_current_price(self.symbol) or pending['actual_price']
-                    
-                    self.executed_orders.append({
-                        'level': pending['level'],
-                        'planned_price': pending['planned_price'],
-                        'executed_price': current_price,
-                        'quantity': pending['volume'] * pending['actual_price'],
-                        'volume': pending['volume'],
-                        'executed_time': datetime.now()
-                    })
-                    
-                    print_log(LogLevel.SUCCESS, 
-                             f"Order {pending['level']} confirmed as executed at {current_price:,.0f} KRW")
-                    
-                    # 체결된 주문은 pending_orders에서 제거
-                    removed_order = self.pending_orders.pop(i)
-                    print_log(LogLevel.INFO, f"Removed order {removed_order['level']} from pending orders")
-                    
-                    executed_any = True
+                # 취소된 주문만 pending_orders에서 제거
+                self.pending_orders = [p for p in self.pending_orders if p not in orders_to_cancel]
             
-            # 기준 보유량 업데이트
-            if executed_any:
-                self.initial_volume = current_volume
-                return True
-        
-        return False
+            # 밀림 적용
+            self._apply_plan_shift(required_shift)
+            
+            # ✅ 핵심: 밀림 적용 후 바로 다음 주문 실행 시도
+            self._execute_next_available_order()
 
-    def _execute_next_order(self):
-        """다음 주문 실행"""
-        if self.next_order_index >= len(self.planned_orders):
-            print_log(LogLevel.INFO, "All planned orders have been placed")
+    def _execute_next_available_order(self):
+        """다음 실행 가능한 주문 실행"""
+        if not self.is_active:
+            return False
+            
+        # 이미 대기 중인 주문이 있으면 실행하지 않음
+        if self.pending_orders:
+            return False
+            
+        # 실행할 다음 주문 찾기
+        for order in sorted(self.active_planned_orders, key=lambda x: x['level']):
+            if not order['executed'] and not self._is_order_pending(order['level']):
+                return self._execute_single_order(order)
+        
+        # 모든 주문 완료
+        if all(order['executed'] for order in self.active_planned_orders):
+            print_log(LogLevel.SUCCESS, "All planned orders executed!")
             self.is_active = False
             return False
             
-        # 미체결 주문이 있으면 절대 다음 주문을 걸지 않음
-        if len(self.pending_orders) > 0:
-            print_log(LogLevel.WARNING, f"Cannot execute next order - {len(self.pending_orders)} pending orders exist")
-            return False
-            
-        order = self.planned_orders[self.next_order_index]
+        return False
+
+    def _execute_single_order(self, order):
+        """단일 주문 실행"""
         current_price = RealMarketData.get_current_price(self.symbol)
-        
-        if current_price is None:
-            print_log(LogLevel.WARNING, "Failed to get current price, retrying...")
+        if not current_price:
             return False
-        
-        # 현재가와 목표가 중 더 낮은 가격 선택
-        actual_order_price = min(current_price, order['planned_price'])
+
+        order_price = order['planned_price']
+        order_volume = order['volume']
         
         print_log(LogLevel.INFO, 
-                 f"Executing order {self.next_order_index + 1}/{len(self.planned_orders)} - "
-                 f"Planned: {order['planned_price']:,.0f} KRW, Current: {current_price:,.0f} KRW, "
-                 f"Actual: {actual_order_price:,.0f} KRW")
+                 f"🎯 Executing order {order['level']} - "
+                 f"Price: {order_price:,.0f} KRW, "
+                 f"Volume: {order_volume:.6f}")
         
-        # 주문 실행
-        if self.place_dynamic_buy_order(actual_order_price, order['volume']):
+        order_uuid = self.place_dynamic_buy_order(order_price, order_volume)
+        if order_uuid:
             pending_order = {
-                'index': self.next_order_index,
                 'level': order['level'],
                 'planned_price': order['planned_price'],
-                'actual_price': actual_order_price,
-                'volume': order['volume'],
-                'order_time': datetime.now()
+                'actual_price': order_price,
+                'volume': order_volume,
+                'order_time': datetime.now(),
+                'uuid': order_uuid
             }
             
             self.pending_orders.append(pending_order)
-            self.next_order_index += 1
-            
-            print_log(LogLevel.SUCCESS, f"Order {self.next_order_index} placed successfully! Pending orders: {len(self.pending_orders)}")
+            print_log(LogLevel.SUCCESS, f"✅ Order {order['level']} placed")
             return True
         else:
-            print_log(LogLevel.ERROR, f"Failed to place order {self.next_order_index + 1}")
+            print_log(LogLevel.ERROR, f"❌ Failed to place order {order['level']}")
             return False
 
-    def cancel_all_pending_orders(self):
-        """모든 대기 중인 주문 취소"""
-        print_log(LogLevel.INFO, f"Cancelling all pending orders for {self.symbol}")
-        OrderCanceler().cancel_buy_orders()
-        self.pending_orders.clear()
-        print_log(LogLevel.INFO, f"Pending orders cleared: {len(self.pending_orders)}")
+    def _check_order_execution(self):
+        """주문 체결 확인"""
+        if not self.pending_orders:
+            return False
+        
+        executed_any = False
+        
+        for i in range(len(self.pending_orders) - 1, -1, -1):
+            pending_order = self.pending_orders[i]
+            
+            if self._is_order_executed(pending_order):
+                self._process_executed_order(pending_order, i)
+                executed_any = True
+        
+        return executed_any
 
-    def _get_current_volume(self):
-        """현재 보유량 조회"""
+    def _is_order_executed(self, pending_order):
+        """주문 체결 여부 확인"""
+        order_uuid = pending_order.get('uuid')
+        if not order_uuid:
+            return False
+        
         try:
-            balance, locked, avg_buy_price = AccountChecker().get_symbol_info(self.symbol)
-            total_volume = balance + locked
-            return total_volume
+            order_info = self._get_order_info(order_uuid)
+            if order_info:
+                state = order_info.get('state')
+                executed_volume = float(order_info.get('executed_volume', 0))
+                return state == 'done' and executed_volume > 0
+            return False
         except Exception as e:
-            print_log(LogLevel.ERROR, f"Error getting volume: {str(e)}")
-            return 0.0
+            print_log(LogLevel.ERROR, f"Error checking order execution: {str(e)}")
+            return False
+
+    def _process_executed_order(self, pending_order, pending_index):
+        """체결된 주문 처리"""
+        order_uuid = pending_order.get('uuid')
+        
+        try:
+            order_info = self._get_order_info(order_uuid)
+            if order_info:
+                executed_volume = float(order_info.get('executed_volume', 0))
+                executed_funds = float(order_info.get('executed_funds', 0))
+                avg_executed_price = executed_funds / executed_volume if executed_volume > 0 else pending_order['actual_price']
+                
+                executed_order = {
+                    'level': pending_order['level'],
+                    'planned_price': pending_order['planned_price'],
+                    'executed_price': avg_executed_price,
+                    'quantity': executed_funds,
+                    'volume': executed_volume,
+                    'uuid': order_uuid,
+                    'executed_time': datetime.now()
+                }
+                
+                self.executed_orders.append(executed_order)
+                
+                for order in self.active_planned_orders:
+                    if order['level'] == pending_order['level']:
+                        order['executed'] = True
+                        break
+                
+                self.pending_orders.pop(pending_index)
+                
+                global buy_uuids
+                if order_uuid in buy_uuids:
+                    buy_uuids.remove(order_uuid)
+                
+                print_log(LogLevel.SUCCESS, 
+                         f"✅ Order {pending_order['level']} executed! "
+                         f"Price: {avg_executed_price:,.0f} KRW")
+                        
+        except Exception as e:
+            print_log(LogLevel.ERROR, f"Error processing executed order: {str(e)}")
+
+    def _is_order_pending(self, level):
+        """주문 대기 중인지 확인"""
+        return any(pending['level'] == level for pending in self.pending_orders)
 
     def place_dynamic_buy_order(self, price, volume):
-        """동적 매수 주문 실행"""
+        """매수 주문 실행"""
         global buy_uuids
         
-        # API 호출 간격 제한
         current_time = datetime.now()
         if self.last_order_time is not None:
             time_since_last = (current_time - self.last_order_time).total_seconds()
@@ -761,7 +867,7 @@ class DynamicBuyOrder:
             'ord_type': 'limit',
         }
 
-        query_string = urlencode(query).encode()
+        query_string = unquote(urlencode(query, doseq=True)).encode("utf-8")
         m = hashlib.sha512()
         m.update(query_string)
         query_hash = m.hexdigest()
@@ -775,7 +881,7 @@ class DynamicBuyOrder:
 
         jwt_token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
         authorization = f'Bearer {jwt_token}'
-        headers = {"Authorization": authorization}
+        headers = {"Authorization": authorization, "Accept": "application/json"}
 
         try:
             def api_call():
@@ -784,29 +890,130 @@ class DynamicBuyOrder:
             
             response_dict = safe_api_call(api_call)
             if 'uuid' in response_dict:
-                buy_uuids.append(response_dict['uuid'])
-                print_log(LogLevel.INFO, 
-                         f"Buy order placed at {price:,.2f} KRW, "
-                         f"amount: {price * volume:,.0f} KRW, volume: {volume:.6f}")
-                return True
+                order_uuid = response_dict['uuid']
+                buy_uuids.append(order_uuid)
+                print_log(LogLevel.INFO, f"💰 Buy order placed at {price:,.0f} KRW")
+                return order_uuid
             else:
                 print_log(LogLevel.ERROR, f"Failed to place buy order: {response_dict}")
-                return False
+                return None
         except Exception as e:
             print_log(LogLevel.ERROR, f"Error placing buy order: {str(e)}")
+            return None
+
+    def cancel_all_pending_orders(self):
+        """✅ 대기 중인 주문만 취소 (체결된 주문은 제외)"""
+        print_log(LogLevel.INFO, f"Cancelling pending orders for {self.symbol}")
+        
+        orders_to_cancel = []
+        for pending_order in self.pending_orders:
+            order_uuid = pending_order.get('uuid')
+            if order_uuid and not self._is_order_executed(pending_order):
+                orders_to_cancel.append(pending_order)
+        
+        cancelled_count = 0
+        for pending_order in orders_to_cancel:
+            order_uuid = pending_order.get('uuid')
+            if order_uuid:
+                if self._cancel_single_order(order_uuid):
+                    cancelled_count += 1
+                    # 글로벌 UUID에서도 제거
+                    global buy_uuids
+                    if order_uuid in buy_uuids:
+                        buy_uuids.remove(order_uuid)
+        
+        # 취소된 주문만 pending_orders에서 제거
+        self.pending_orders = [p for p in self.pending_orders if p not in orders_to_cancel]
+        
+        print_log(LogLevel.INFO, f"Cancelled {cancelled_count} pending orders, {len(self.pending_orders)} remaining")
+
+    def _cancel_single_order(self, order_uuid):
+        """단일 주문 취소"""
+        try:
+            params = {'uuid': order_uuid}
+            query_string = unquote(urlencode(params, doseq=True)).encode("utf-8")
+            
+            m = hashlib.sha512()
+            m.update(query_string)
+            query_hash = m.hexdigest()
+
+            payload = {
+                'access_key': ACCESS_KEY,
+                'nonce': str(uuid.uuid4()),
+                'query_hash': query_hash,
+                'query_hash_alg': 'SHA512',
+            }
+
+            jwt_token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+            authorization = f'Bearer {jwt_token}'
+            headers = {"Authorization": authorization, "Accept": "application/json"}
+
+            def api_call():
+                response = requests.delete(SERVER_URL + "/v1/order", params=params, headers=headers)
+                return response
+            
+            response = safe_api_call(api_call)
+            if response.status_code == 200:
+                print_log(LogLevel.INFO, f"Order {order_uuid[:8]}... cancelled")
+                return True
+            elif response.status_code == 404:
+                print_log(LogLevel.WARNING, f"Order {order_uuid[:8]}... already cancelled or executed")
+                return True
+            else:
+                print_log(LogLevel.WARNING, f"Failed to cancel order {order_uuid[:8]}...: {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print_log(LogLevel.ERROR, f"Error cancelling order {order_uuid[:8]}...: {str(e)}")
             return False
 
-    def get_execution_summary(self):
-        """주문 실행 요약 정보"""
-        executed_count = len(self.executed_orders)
-        total_planned = len(self.planned_orders)
-        
+    def _get_order_info(self, order_uuid):
+        """주문 정보 조회"""
+        try:
+            params = {'uuid': order_uuid}
+            query_string = unquote(urlencode(params, doseq=True)).encode("utf-8")
+            m = hashlib.sha512()
+            m.update(query_string)
+            query_hash = m.hexdigest()
+
+            payload = {
+                'access_key': ACCESS_KEY,
+                'nonce': str(uuid.uuid4()),
+                'query_hash': query_hash,
+                'query_hash_alg': 'SHA512',
+            }
+
+            jwt_token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+            authorization = f'Bearer {jwt_token}'
+            headers = {"Authorization": authorization, "Accept": "application/json"}
+
+            def api_call():
+                response = requests.get(SERVER_URL + "/v1/order", params=params, headers=headers)
+                return response.json()
+            
+            response_dict = safe_api_call(api_call)
+            return response_dict
+                
+        except Exception as e:
+            print_log(LogLevel.ERROR, f"Error getting order info: {str(e)}")
+            return None
+
+    def stop_trading(self):
+        """거래 중지"""
+        self.is_active = False
+        self.cancel_all_pending_orders()
+        print_log(LogLevel.INFO, f"Trading stopped for {self.symbol}")
+
+    def get_status(self):
+        """상태 정보"""
         return {
-            'executed_count': executed_count,
-            'total_planned': total_planned,
-            'placed_count': self.next_order_index,
+            'symbol': self.symbol,
             'is_active': self.is_active,
-            'pending_count': len(self.pending_orders)
+            'current_price': self.current_price,
+            'plan_shift_amount': self.plan_shift_amount,
+            'total_planned': len(self.active_planned_orders),
+            'executed_orders': len(self.executed_orders),
+            'pending_orders': len(self.pending_orders)
         }
 
 class SellOrder:
@@ -865,7 +1072,7 @@ class TradingManager:
         self.last_command_check = None
         self.command_check_interval = 2  # 2초로 단축 (기존 5초)
         self.forced_symbol_change = False
-        self.command_symbol_override = None  # 새로운 필드: command.txt에서 지정된 심볼
+        self.pending_symbol_change = None  # 대기 중인 심볼 변경
         
     def set_symbol(self, symbol):
         """심볼 설정 및 캐시"""
@@ -878,14 +1085,7 @@ class TradingManager:
         print_log(LogLevel.INFO, f"Trading symbol set to: {symbol}")
         
     def get_cached_symbol(self):
-        """캐시된 심볼 반환 - command 오버라이드 우선"""
-        # command 오버라이드가 있으면 즉시 반영
-        if self.command_symbol_override:
-            symbol_to_use = self.command_symbol_override
-            self.command_symbol_override = None  # 적용 후 초기화
-            self.set_symbol(symbol_to_use)
-            return symbol_to_use
-            
+        """캐시된 심볼 반환"""
         global current_trading_symbol, symbol_cache_time
         
         if (current_trading_symbol and symbol_cache_time and
@@ -896,7 +1096,7 @@ class TradingManager:
         return None
         
     def check_command_file(self):
-        """command.txt 파일 변경 체크 및 심볼 변경 처리 - 강화된 로직"""
+        """command.txt 파일 변경 체크 - 거래 중단 없이 대기만 시킴"""
         current_time = datetime.now()
         
         if (self.last_command_check and 
@@ -914,22 +1114,15 @@ class TradingManager:
                     if parts[0] == 'SYMBOL' and len(parts) > 1:
                         new_symbol = parts[1]
                         
-                        # 현재 심볼과 다를 경우 즉시 변경
-                        if new_symbol != self.current_symbol:
+                        # 현재 심볼과 다를 경우 대기 목록에 추가
+                        if new_symbol != self.current_symbol and new_symbol != self.pending_symbol_change:
                             # 변동성 보호 체크
                             if VolatilityProtector.check_volatility_protection(new_symbol):
                                 print_log(LogLevel.WARNING, f"Command symbol {new_symbol} blocked by volatility protection")
                                 return False
                                 
-                            print_log(LogLevel.INFO, f"Command file changed symbol to: {new_symbol}")
-                            self.command_symbol_override = new_symbol  # 오버라이드 저장
-                            self.forced_symbol_change = True
-                            
-                            # 현재 거래 중이면 주문 취소
-                            if self.buy_orders_placed or self.buy_orders_executed:
-                                print_log(LogLevel.WARNING, "Cancelling current orders due to symbol change")
-                                OrderCanceler().cancel_all_orders(3)  # 모든 주문 취소
-                            
+                            print_log(LogLevel.INFO, f"Symbol change requested: {new_symbol} (will apply after current trading)")
+                            self.pending_symbol_change = new_symbol
                             return True
                             
                     elif parts[0] == 'EXIT':
@@ -942,23 +1135,29 @@ class TradingManager:
             
         return False
 
-    def apply_command_symbol_override(self):
-        """command.txt에서 지정된 심볼을 적용"""
-        if self.command_symbol_override:
-            symbol_to_use = self.command_symbol_override
-            self.command_symbol_override = None  # 적용 후 초기화
+    def has_pending_symbol_change(self):
+        """대기 중인 심볼 변경이 있는지 확인"""
+        return self.pending_symbol_change is not None
+
+    def apply_pending_symbol_change(self):
+        """대기 중인 심볼 변경 적용"""
+        if self.pending_symbol_change:
+            symbol_to_use = self.pending_symbol_change
+            self.pending_symbol_change = None
             self.set_symbol(symbol_to_use)
+            print_log(LogLevel.SUCCESS, f"Applied pending symbol change: {symbol_to_use}")
             return symbol_to_use
         return None
 
-    def should_process_command_change(self):
-        """command 변경을 처리할 수 있는 상태인지 확인 - 완화된 조건"""
-        # 거래가 완전히 대기 상태이거나, 강제 변경 요청이 있을 때 처리
-        return (not self.buy_orders_placed and 
-                not self.buy_orders_executed and 
-                not self.sell_orders_placed and 
-                not self.sell_orders_executed) or self.forced_symbol_change
-        
+    def get_command_symbol_override(self):
+        """command.txt에서 지정된 심볼 오버라이드 값을 반환"""
+        return self.pending_symbol_change
+
+    def is_trading_in_progress(self):
+        """거래가 진행 중인지 확인"""
+        return (self.buy_orders_placed or self.buy_orders_executed or 
+                self.sell_orders_placed or self.sell_orders_executed)
+
     def mark_buy_orders_placed(self):
         """매수 주문 걸림 표시"""
         self.buy_orders_placed = True
@@ -1022,6 +1221,7 @@ class TradingManager:
         self.start_time = None
         self.buy_order_start_time = None
         self.forced_symbol_change = False
+        # pending_symbol_change는 유지 (다음 사이클에서 적용)
         print_log(LogLevel.INFO, "Trading state reset (symbol cache maintained)")
 
 class SellController:
@@ -1245,7 +1445,7 @@ class VolatilityProtector:
     """동적 매수 보호 클래스 - 고변동성 코인 매수 방지"""
     
     @staticmethod
-    def check_volatility_protection(symbol, lookback_period=60, threshold_percentage=40.0):
+    def check_volatility_protection(symbol, lookback_period=60, threshold_percentage=60.0):
         """
         변동성 보호 체크
         최근 lookback_period 캔들 동안 최소값과 최대값 차이가 threshold_percentage 이상이면 매수 금지
@@ -1816,10 +2016,10 @@ if __name__=="__main__":
         else:
             OrderCanceler().cancel_all_orders(1)
 
-        drop_percentage = args.drop_percentage if args.drop_percentage else 0.3
+        drop_percentage = args.drop_percentage if args.drop_percentage else 1 / 3
         distribution_type = args.distribution_type if args.distribution_type else DynamicBuyOrder.DistributionType.LOG_LINEAR_II
-        distribution_weight = args.weight if args.weight else 0.04
-        profit_percentage = args.profit_percentage if args.profit_percentage else 0.35
+        distribution_weight = args.weight if args.weight else 1 / 30
+        profit_percentage = args.profit_percentage if args.profit_percentage else 0.32
 
         InitialBalance = S = AccountChecker().get_krw_balance()
         print_log(LogLevel.INFO, f"Available KRW: {int(S):,}")
@@ -1838,10 +2038,11 @@ if __name__=="__main__":
         while True:
             cycle_count += 1
 
-            # 1. command.txt 변경 체크 (최우선)
-            if trading_manager.check_command_file():
-                print_log(LogLevel.INFO, "Symbol changed by command file, restarting cycle")
-                continue
+            # 1. command.txt 변경 체크 (새로운 심볼만 저장, 현재 거래는 중단하지 않음)
+            new_symbol_detected = trading_manager.check_command_file()
+            if new_symbol_detected:
+                print_log(LogLevel.INFO, f"New symbol detected in command file: {new_symbol_detected}, will switch after current trading completes")
+                # 현재 거래는 계속 진행, 다음 사이클에서 새로운 심볼로 전환
 
             cached_symbol = trading_manager.get_cached_symbol()
             if cached_symbol:
@@ -1917,32 +2118,25 @@ if __name__=="__main__":
 
             # 매수 프로세스 시작 전 command 변경 체크
             if trading_manager.should_place_buy_orders():
-                # 매수 시작 전 command 체크 (더 자주 체크)
-                if trading_manager.check_command_file():
-                    print_log(LogLevel.INFO, "Symbol changed before buying, restarting cycle")
-                    continue
-                    
-                # command 오버라이드가 있으면 즉시 적용
-                if trading_manager.command_symbol_override:
-                    symbol = trading_manager.apply_command_symbol_override()
+                # command 오버라이드가 있으면 즉시 적용 (새로운 거래 시작 시에만)
+                if trading_manager.pending_symbol_change and not trading_manager.is_trading_in_progress():
+                    symbol = trading_manager.apply_pending_symbol_change()
                     print_log(LogLevel.INFO, f"Applied command override symbol: {symbol}")
                     analyzer = MarketAnalyzer(symbol)
                     confidence = analyzer.calculate_composite_confidence()
                     
                 analyzer = MarketAnalyzer(symbol)
                 base_drop_count = 18
-                drop_count = max(base_drop_count, int(base_drop_count * (2.0 - confidence) * 1.2))
+                drop_count = max(base_drop_count, int(base_drop_count * (2.0 - confidence) * 0))
 
                 print_log(LogLevel.INFO, 
                          f"Market Analysis - RSI: {analyzer.get_rsi():.2f}, "
                          f"Volatility: {analyzer.volatility_ratio:.4f}, Confidence: {confidence:.2f}, "
                          f"Drop Levels: {drop_count} (base: {base_drop_count})")
 
-                # 동적 매수
-                distribution_type_dynamic = DynamicBuyOrder.DistributionType.LINEAR if confidence > 0.8 else DynamicBuyOrder.DistributionType.LOG_LINEAR_I if confidence < 0.3 else DynamicBuyOrder.DistributionType.LOG_LINEAR_II
-                
+                distribution_type = DynamicBuyOrder.DistributionType.LOG_LINEAR_I if confidence > 0.8 else DynamicBuyOrder.DistributionType.LOG_LINEAR_II if confidence < 0.3 else DynamicBuyOrder.DistributionType.PARABOLIC_II
                 dynamic_buyer = DynamicBuyOrder(symbol, analyzer.candle.current_price, S, distribution_weight, 0)
-                dynamic_buyer.calculate_order_plan(drop_percentage, drop_count, distribution_type_dynamic, confidence)
+                dynamic_buyer.calculate_order_plan(drop_percentage, drop_count, distribution_type, confidence)
 
                 # 동적 매수 실행
                 if dynamic_buyer.execute_dynamic_buy_orders():
@@ -1958,6 +2152,7 @@ if __name__=="__main__":
                     cycle_timeout = 86400  
                     
                     trading_completed = False
+                    command_changed_during_trading = False
                     
                     while not trading_completed:
                         current_time = datetime.now()
@@ -1968,14 +2163,14 @@ if __name__=="__main__":
                             trading_completed = True
                             break
                         
-                        # 1. command 변경 체크 (거래 중에도 체크)
+                        # 1. command 변경 체크 (거래 중에는 플래그만 설정, 중단하지 않음)
                         if trading_manager.check_command_file():
-                            print_log(LogLevel.INFO, "Symbol changed during trading, cancelling orders and restarting")
-                            OrderCanceler().cancel_all_orders(3)  # 모든 주문 취소
-                            trading_completed = True
-                            break
+                            command_changed_during_trading = True
+                            new_symbol = trading_manager.get_command_symbol_override()
+                            print_log(LogLevel.INFO, f"Command file changed during trading (new symbol: {new_symbol}). Will complete current trading first.")
+                            # 현재 거래는 계속 진행, 다음 사이클에서 새로운 심볼로 전환
                         
-                        # 2. 동적 매수 진행 체크 (미체결 주문 있으면 다음 주문 안 걸림)
+                        # 2. 동적 매수 진행 체크
                         if dynamic_buyer.is_active:
                             dynamic_buyer.check_and_continue()
                         else:
@@ -2020,13 +2215,10 @@ if __name__=="__main__":
                         
                         time.sleep(SLEEP_TIME)
                     
-                    # 최종 매수 결과 출력
-                    final_summary = dynamic_buyer.get_execution_summary()
-                    print_log(LogLevel.SUCCESS, 
-                             f"Final Buy Result - "
-                             f"Placed: {final_summary['placed_count']}/{final_summary['total_planned']}, "
-                             f"Executed: {final_summary['executed_count']}/{final_summary['total_planned']}, "
-                             f"Pending: {final_summary['pending_count']}")
+                    # 거래 중 command 변경이 있었으면 알림
+                    if command_changed_during_trading:
+                        new_symbol = trading_manager.get_command_symbol_override()
+                        print_log(LogLevel.INFO, f"Current trading completed. Will switch to new symbol '{new_symbol}' in next cycle.")
 
                 log_state(LogState.BUYING, symbol)
                 print_log(LogLevel.INFO, f"Buy orders placed for '{symbol}' with confidence {confidence:.2f}")
