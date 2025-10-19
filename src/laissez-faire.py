@@ -96,6 +96,45 @@ def log_state(state, additional_info=''):
 
 class UpbitTickSystem:
     @staticmethod
+    def get_minimum_tick(price):
+        t = price
+    
+        if t >= 2000000:
+            t = 1000
+        elif t >= 1000000:
+            t = 1000
+        elif t >= 500000:
+            t = 500
+        elif t >= 100000:
+            t = 100
+        elif t >= 50000:
+            t = 50
+        elif t >= 10000:
+            t = 10
+        elif t >= 5000:
+            t = 5
+        elif t >= 1000:
+            t = 1
+        elif t >= 100:
+            t = 1
+        elif t >= 10:
+            t = 0.1
+        elif t >= 1:
+            t = 0.01
+        elif t >= 0.1:
+            t = 0.001
+        elif t >= 0.01:
+            t = 0.0001
+        elif t >= 0.0001:
+            t = 0.000001
+        elif t >= 0.00001:
+            t = 0.0000001
+        else:
+            t = 0.00000001
+    
+        return t
+
+    @staticmethod
     def round_down(price, proportion):
         t = price - (price / 100) * proportion
     
@@ -188,6 +227,32 @@ class UpbitTickSystem:
             return True
         return False
 
+class RealMarketData:
+    @staticmethod
+    def get_current_price(symbol):
+        try:
+            def api_call():
+                url = f"{TICKER_URL}?markets=KRW-{symbol}"
+                headers = {"Accept": "application/json"}
+                response = requests.get(url, headers=headers, timeout=10)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if data and len(data) > 0:
+                        return float(data[0]['trade_price'])
+                elif response.status_code == 429:
+                    print_log(LogLevel.WARNING, "API rate limit exceeded")
+                    time.sleep(1)
+                    return None
+                else:
+                    print_log(LogLevel.WARNING, f"Failed to get current price: {response.status_code}")
+                    return None
+            
+            return safe_api_call(api_call)
+        except Exception as e:
+            print_log(LogLevel.EXCEPTION, f"Error getting current price: {str(e)}")
+            return None
+
 class RateLimiter:
     def __init__(self, interval):
         self.interval = interval
@@ -222,31 +287,7 @@ def safe_api_call(func, *args, **kwargs):
                 print_log(LogLevel.ERROR, f"API call failed after {max_retries} attempts: {str(e)}")
                 raise e
 
-class RealMarketData:
-    @staticmethod
-    def get_current_price(symbol):
-        try:
-            def api_call():
-                url = f"{TICKER_URL}?markets=KRW-{symbol}"
-                headers = {"Accept": "application/json"}
-                response = requests.get(url, headers=headers, timeout=10)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if data and len(data) > 0:
-                        return float(data[0]['trade_price'])
-                elif response.status_code == 429:
-                    print_log(LogLevel.WARNING, "API rate limit exceeded")
-                    time.sleep(1)
-                    return None
-                else:
-                    print_log(LogLevel.WARNING, f"Failed to get current price: {response.status_code}")
-                    return None
-            
-            return safe_api_call(api_call)
-        except Exception as e:
-            print_log(LogLevel.EXCEPTION, f"Error getting current price: {str(e)}")
-            return None
+
 
 class OrderCanceler:
     def cancel_buy_orders(self):
@@ -264,7 +305,7 @@ class OrderCanceler:
             
     def cancel_sell_orders(self):
         global sell_uuids
-        
+
         while True:
             try:
                 for uuid_val in sell_uuids:
@@ -414,12 +455,13 @@ class AccountChecker:
         return -1, -1, -1
 
 class DynamicBuyOrder:
-    """동적 분할 매수 주문 관리 클래스 - 체결된 주문 취소 문제 해결"""
+    """동적 분할 매수 주문 관리 클래스 - 저가 기준 재설계"""
     
-    def __init__(self, symbol, current_price, total_amount, weight, exclude_count=0):
+    def __init__(self, symbol, current_price, low_price, total_amount, weight, exclude_count=0):
         self.symbol = symbol
-        self.original_price = current_price
+        self.original_price = current_price + UpbitTickSystem.get_minimum_tick(current_price)
         self.current_price = current_price
+        self.low_price = low_price  # 저가를 별도로 받음
         self.total_amount = total_amount
         self.weight = weight
         self.exclude_count = exclude_count
@@ -440,6 +482,9 @@ class DynamicBuyOrder:
         # 밀림 관리
         self.plan_shift_amount = 0.0
         self.last_shift_check_price = current_price
+        
+        # OrderCanceler 인스턴스
+        self.order_canceler = OrderCanceler()
 
     class DistributionType(Enum):
         LINEAR = 1
@@ -450,9 +495,9 @@ class DynamicBuyOrder:
         EXPONENTIAL = 6
         FIBONACCI = 7
 
-    def calculate_order_plan(self, drop_percentage, drop_count, distribution_type, confidence=1.0):
-        """주문 계획 계산"""
-        print_log(LogLevel.INFO, f"Starting order plan calculation for {self.symbol}")
+    def calculate_order_plan(self, drop_percentage, drop_count, distribution_type):
+        """주문 계획 계산 - 저가 기준"""
+        print_log(LogLevel.INFO, f"Starting order plan calculation for {self.symbol} based on low price {self.low_price:.4f}")
         
         self.original_planned_orders = []
         self.active_planned_orders = []
@@ -475,7 +520,7 @@ class DynamicBuyOrder:
             self._calculate_linear_plan(drop_percentage, drop_count)
         
         self.original_planned_orders = [order.copy() for order in self.active_planned_orders]
-        print_log(LogLevel.SUCCESS, f"Calculated {len(self.active_planned_orders)} buy orders for {self.symbol}")
+        print_log(LogLevel.SUCCESS, f"Calculated {len(self.active_planned_orders)} buy orders for {self.symbol} based on low price {self.low_price:.4f}")
 
     def _calculate_linear_plan(self, drop_percentage, drop_count):
         total_weight = sum(range(1, drop_count + 1))
@@ -591,38 +636,38 @@ class DynamicBuyOrder:
                 'shift_applied': 0.0
             })
 
-    def _calculate_required_shift(self, current_price):
-        """필요한 밀림량 계산"""
+    def _calculate_required_shift(self, current_low_price):
+        """필요한 밀림량 계산 - 저가 기준"""
         required_shift = 0.0
         
         for order in self.active_planned_orders:
-            if not order['executed'] and order['planned_price'] > current_price:
-                gap = order['planned_price'] - current_price
+            if not order['executed'] and order['planned_price'] > current_low_price:
+                gap = order['planned_price'] - current_low_price
                 if gap > required_shift:
                     required_shift = gap
         
-        # 최소 밀림량 체크 (1000원 이상)
-        if required_shift < 1000:
+        # 최소 밀림량 체크 (티커 단위)
+        min_shift = 0.0001  # 기본 틱 사이즈
+        if required_shift < min_shift:
             return 0.0
             
         return required_shift
 
     def _apply_plan_shift(self, shift_amount):
-        """계획 밀림 적용"""
-        print_log(LogLevel.INFO, f"🔄 Applying plan shift: {shift_amount:,.0f} KRW")
+        """계획 밀림 적용 - 저가 기준"""
+        print_log(LogLevel.INFO, f"Applying plan shift: {shift_amount:.4f} {self.symbol}")
         
         # 모든 미체결 주문에 밀림 적용
         for order in self.active_planned_orders:
             if not order['executed']:
-                new_original_price = order['original_planned_price'] - shift_amount
-                new_planned_price = UpbitTickSystem.round_down(UpbitTickSystem.round_up(new_original_price), 0)
+                new_planned_price = UpbitTickSystem.round_down(order['original_planned_price'] - shift_amount, 0)
                 
                 order['planned_price'] = new_planned_price
                 order['shift_applied'] = shift_amount
-                order['volume'] = order['quantity'] / order['planned_price']
+                order['volume'] = order['quantity'] / order['planned_price'] if order['planned_price'] > 0 else 0
         
         self.plan_shift_amount = shift_amount
-        print_log(LogLevel.SUCCESS, f"✅ Plan shifted by {shift_amount:,.0f} KRW")
+        print_log(LogLevel.SUCCESS, f"✅ Plan shifted by {shift_amount:.4f} {self.symbol}")
 
     def execute_dynamic_buy_orders(self):
         """동적 매수 시작"""
@@ -635,13 +680,13 @@ class DynamicBuyOrder:
         self.plan_shift_amount = 0.0
         self.first_order_start_time = datetime.now()
         
-        print_log(LogLevel.INFO, f"Starting dynamic buying with {len(self.active_planned_orders)} planned orders")
+        print_log(LogLevel.INFO, f"Starting dynamic buying with {len(self.active_planned_orders)} planned orders based on low price {self.low_price:.4f}")
         
         # 바로 첫 주문 실행
         return self._execute_next_available_order()
 
     def check_and_continue(self):
-        """체결 확인 및 다음 주문 실행"""
+        """체결 확인 및 다음 주문 실행 - 저가 기준"""
         if not self.is_active:
             return False
             
@@ -652,14 +697,14 @@ class DynamicBuyOrder:
             return False
         self.last_check_time = current_time
         
-        # 현재가 확인
+        # 현재가와 저가 확인
         current_price = RealMarketData.get_current_price(self.symbol)
         if not current_price:
             return False
             
         self.current_price = current_price
         
-        # 계획 밀림 확인
+        # 계획 밀림 확인 (현재가 기준)
         self._check_and_apply_plan_shift(current_price)
         
         # 첫 주문 타임아웃 체크
@@ -684,7 +729,7 @@ class DynamicBuyOrder:
         return False
 
     def _check_and_apply_plan_shift(self, current_price):
-        """계획 밀림 확인 및 적용 - 체결된 주문 취소 문제 해결"""
+        """계획 밀림 확인 및 적용 - 현재가 기준"""
         required_shift = self._calculate_required_shift(current_price)
         
         if required_shift > 0:
@@ -692,8 +737,11 @@ class DynamicBuyOrder:
             orders_to_cancel = []
             for pending_order in self.pending_orders:
                 order_uuid = pending_order.get('uuid')
-                if order_uuid and not self._is_order_executed(pending_order):
-                    orders_to_cancel.append(pending_order)
+                if order_uuid:
+                    # 주문 상태를 먼저 확인하여 체결 여부 확인
+                    order_info = self._get_order_info(order_uuid)
+                    if order_info and order_info.get('state') != 'done':
+                        orders_to_cancel.append(pending_order)
             
             if orders_to_cancel:
                 print_log(LogLevel.INFO, f"Cancelling {len(orders_to_cancel)} pending orders due to plan shift")
@@ -748,7 +796,7 @@ class DynamicBuyOrder:
         
         print_log(LogLevel.INFO, 
                  f"🎯 Executing order {order['level']} - "
-                 f"Price: {order_price:,.0f} KRW, "
+                 f"Price: {order_price:.4f} KRW, "
                  f"Volume: {order_volume:.6f}")
         
         order_uuid = self.place_dynamic_buy_order(order_price, order_volume)
@@ -769,22 +817,6 @@ class DynamicBuyOrder:
             print_log(LogLevel.ERROR, f"❌ Failed to place order {order['level']}")
             return False
 
-    def _check_order_execution(self):
-        """주문 체결 확인"""
-        if not self.pending_orders:
-            return False
-        
-        executed_any = False
-        
-        for i in range(len(self.pending_orders) - 1, -1, -1):
-            pending_order = self.pending_orders[i]
-            
-            if self._is_order_executed(pending_order):
-                self._process_executed_order(pending_order, i)
-                executed_any = True
-        
-        return executed_any
-
     def _is_order_executed(self, pending_order):
         """주문 체결 여부 확인"""
         order_uuid = pending_order.get('uuid')
@@ -802,43 +834,77 @@ class DynamicBuyOrder:
             print_log(LogLevel.ERROR, f"Error checking order execution: {str(e)}")
             return False
 
-    def _process_executed_order(self, pending_order, pending_index):
+    def _check_order_execution(self):
+        """주문 체결 확인"""
+        if not self.pending_orders:
+            return False
+        
+        executed_any = False
+        
+        for i in range(len(self.pending_orders) - 1, -1, -1):
+            pending_order = self.pending_orders[i]
+            order_uuid = pending_order.get('uuid')
+            
+            if not order_uuid:
+                continue
+                
+            try:
+                order_info = self._get_order_info(order_uuid)
+                if order_info:
+                    state = order_info.get('state')
+                    executed_volume = float(order_info.get('executed_volume', 0))
+                    
+                    if state == 'done' and executed_volume > 0:
+                        # 체결된 주문 처리
+                        self._process_executed_order(pending_order, i, order_info)
+                        executed_any = True
+                    elif state == 'cancel':
+                        # 취소된 주문은 pending에서 제거
+                        self.pending_orders.pop(i)
+                        print_log(LogLevel.INFO, f"Order {pending_order['level']} was cancelled")
+                        
+            except Exception as e:
+                print_log(LogLevel.ERROR, f"Error checking order execution: {str(e)}")
+                continue
+        
+        return executed_any
+
+    def _process_executed_order(self, pending_order, pending_index, order_info):
         """체결된 주문 처리"""
         order_uuid = pending_order.get('uuid')
         
         try:
-            order_info = self._get_order_info(order_uuid)
-            if order_info:
-                executed_volume = float(order_info.get('executed_volume', 0))
-                executed_funds = float(order_info.get('executed_funds', 0))
-                avg_executed_price = executed_funds / executed_volume if executed_volume > 0 else pending_order['actual_price']
-                
-                executed_order = {
-                    'level': pending_order['level'],
-                    'planned_price': pending_order['planned_price'],
-                    'executed_price': avg_executed_price,
-                    'quantity': executed_funds,
-                    'volume': executed_volume,
-                    'uuid': order_uuid,
-                    'executed_time': datetime.now()
-                }
-                
-                self.executed_orders.append(executed_order)
-                
-                for order in self.active_planned_orders:
-                    if order['level'] == pending_order['level']:
-                        order['executed'] = True
-                        break
-                
-                self.pending_orders.pop(pending_index)
-                
-                global buy_uuids
-                if order_uuid in buy_uuids:
-                    buy_uuids.remove(order_uuid)
-                
-                print_log(LogLevel.SUCCESS, 
-                         f"✅ Order {pending_order['level']} executed! "
-                         f"Price: {avg_executed_price:,.0f} KRW")
+            executed_volume = float(order_info.get('executed_volume', 0))
+            executed_funds = float(order_info.get('executed_funds', 0))
+            avg_executed_price = executed_funds / executed_volume if executed_volume > 0 else pending_order['actual_price']
+            
+            executed_order = {
+                'level': pending_order['level'],
+                'planned_price': pending_order['planned_price'],
+                'executed_price': avg_executed_price,
+                'quantity': executed_funds,
+                'volume': executed_volume,
+                'uuid': order_uuid,
+                'executed_time': datetime.now()
+            }
+            
+            self.executed_orders.append(executed_order)
+            
+            for order in self.active_planned_orders:
+                if order['level'] == pending_order['level']:
+                    order['executed'] = True
+                    break
+            
+            self.pending_orders.pop(pending_index)
+            
+            global buy_uuids
+            if order_uuid in buy_uuids:
+                buy_uuids.remove(order_uuid)
+            
+            print_log(LogLevel.SUCCESS, 
+                     f"✅ Order {pending_order['level']} executed! "
+                     f"Price: {avg_executed_price:.4f} {self.symbol}, "
+                     f"Volume: {executed_volume:.6f}")
                         
         except Exception as e:
             print_log(LogLevel.ERROR, f"Error processing executed order: {str(e)}")
@@ -892,7 +958,7 @@ class DynamicBuyOrder:
             if 'uuid' in response_dict:
                 order_uuid = response_dict['uuid']
                 buy_uuids.append(order_uuid)
-                print_log(LogLevel.INFO, f"💰 Buy order placed at {price:,.0f} KRW")
+                print_log(LogLevel.INFO, f"💰 Buy order placed at {price:.4f} KRW, Volume: {volume:.6f}")
                 return order_uuid
             else:
                 print_log(LogLevel.ERROR, f"Failed to place buy order: {response_dict}")
@@ -928,41 +994,16 @@ class DynamicBuyOrder:
         print_log(LogLevel.INFO, f"Cancelled {cancelled_count} pending orders, {len(self.pending_orders)} remaining")
 
     def _cancel_single_order(self, order_uuid):
-        """단일 주문 취소"""
+        """단일 주문 취소 - OrderCanceler 사용"""
         try:
-            params = {'uuid': order_uuid}
-            query_string = unquote(urlencode(params, doseq=True)).encode("utf-8")
-            
-            m = hashlib.sha512()
-            m.update(query_string)
-            query_hash = m.hexdigest()
+            if order_uuid:
+                success = self.order_canceler.cancel_order(order_uuid)
+                if success:
+                    print_log(LogLevel.INFO, f"Order {order_uuid[:8]}... cancelled")
+                    return True               
+                print_log(LogLevel.WARNING, f"Failed to cancel order {order_uuid[:8]}...")
 
-            payload = {
-                'access_key': ACCESS_KEY,
-                'nonce': str(uuid.uuid4()),
-                'query_hash': query_hash,
-                'query_hash_alg': 'SHA512',
-            }
-
-            jwt_token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-            authorization = f'Bearer {jwt_token}'
-            headers = {"Authorization": authorization, "Accept": "application/json"}
-
-            def api_call():
-                response = requests.delete(SERVER_URL + "/v1/order", params=params, headers=headers)
-                return response
-            
-            response = safe_api_call(api_call)
-            if response.status_code == 200:
-                print_log(LogLevel.INFO, f"Order {order_uuid[:8]}... cancelled")
-                return True
-            elif response.status_code == 404:
-                print_log(LogLevel.WARNING, f"Order {order_uuid[:8]}... already cancelled or executed")
-                return True
-            else:
-                print_log(LogLevel.WARNING, f"Failed to cancel order {order_uuid[:8]}...: {response.status_code}")
-                return False
-                
+            return False
         except Exception as e:
             print_log(LogLevel.ERROR, f"Error cancelling order {order_uuid[:8]}...: {str(e)}")
             return False
@@ -1006,15 +1047,69 @@ class DynamicBuyOrder:
 
     def get_status(self):
         """상태 정보"""
+        total_executed_quantity = sum(order['quantity'] for order in self.executed_orders)
+        total_executed_volume = sum(order['volume'] for order in self.executed_orders)
+        
         return {
             'symbol': self.symbol,
             'is_active': self.is_active,
             'current_price': self.current_price,
+            'low_price': self.low_price,
             'plan_shift_amount': self.plan_shift_amount,
             'total_planned': len(self.active_planned_orders),
             'executed_orders': len(self.executed_orders),
-            'pending_orders': len(self.pending_orders)
+            'pending_orders': len(self.pending_orders),
+            'total_executed_quantity': total_executed_quantity,
+            'total_executed_volume': total_executed_volume,
+            'completion_rate': (len(self.executed_orders) / len(self.active_planned_orders)) * 100 if self.active_planned_orders else 0
         }
+
+    def get_detailed_status(self):
+        """상세 상태 정보"""
+        status = self.get_status()
+        status['planned_orders'] = [
+            {
+                'level': order['level'],
+                'planned_price': order['planned_price'],
+                'quantity': order['quantity'],
+                'volume': order['volume'],
+                'executed': order['executed'],
+                'shift_applied': order['shift_applied']
+            }
+            for order in self.active_planned_orders
+        ]
+        status['executed_orders_detail'] = [
+            {
+                'level': order['level'],
+                'executed_price': order['executed_price'],
+                'quantity': order['quantity'],
+                'volume': order['volume'],
+                'executed_time': order['executed_time'].strftime("%Y-%m-%d %H:%M:%S")
+            }
+            for order in self.executed_orders
+        ]
+        status['pending_orders_detail'] = [
+            {
+                'level': order['level'],
+                'actual_price': order['actual_price'],
+                'volume': order['volume'],
+                'order_time': order['order_time'].strftime("%Y-%m-%d %H:%M:%S")
+            }
+            for order in self.pending_orders
+        ]
+        return status
+
+    def reset(self):
+        """리셋 - 새로운 거래 준비"""
+        self.stop_trading()
+        self.active_planned_orders.clear()
+        self.executed_orders.clear()
+        self.pending_orders.clear()
+        self.plan_shift_amount = 0.0
+        self.last_order_time = None
+        self.last_check_time = None
+        self.first_order_start_time = None
+        print_log(LogLevel.INFO, f"Reset completed for {self.symbol}")
 
 class SellOrder:
     def __init__(self, symbol, volume, price):
@@ -1380,11 +1475,6 @@ class SellController:
 
         if not self.has_holdings(symbol):
             if trading_manager.sell_orders_placed:
-                global sell_uuids
-                
-                if len(sell_uuids) > 0:
-                    sell_uuids.pop(0)
-
                 trading_manager.mark_sell_orders_executed()
                 print_log(LogLevel.SUCCESS, "보유량 없음 - 거래 완료")
             return True
@@ -1517,149 +1607,6 @@ class VolatilityProtector:
             # 에러 발생 시 보호 적용 (안전 측면)
             return True
 
-# --------------------------
-# Refactored Confidence Calculator
-# --------------------------
-def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
-    return max(lo, min(hi, x))
-
-def sigmoid(x: float, k: float = 1.0) -> float:
-    try:
-        return clamp(1.0 / (1.0 + math.exp(-k * x)))
-    except OverflowError:
-        return 0.0 if x < 0 else 1.0
-
-def score_rsi(rsi: float, persist_above_80: int = 0, persist_thresh: int = 3) -> float:
-    if rsi < 30: base = 0.05
-    elif rsi < 45: base = 0.05 + 0.25 * ((rsi - 30)/15)
-    elif rsi < 55: base = 0.30 + 0.25 * ((rsi - 45)/10)
-    elif rsi < 65: base = 0.55 + 0.15 * ((rsi - 55)/10)
-    elif rsi < 75: base = 0.70 + 0.10 * ((rsi - 65)/10)
-    elif rsi < 80: base = 0.80
-    else: base = 0.82
-
-    fatigue = 0.0
-    if rsi >= 80:
-        frac = clamp((rsi - 80)/20)
-        if persist_above_80 < persist_thresh:
-            fatigue = 0.25 * (1 - persist_above_80/max(1,persist_thresh)) * frac
-        else:
-            fatigue = -0.04 * min(persist_above_80 - persist_thresh, 5) * frac
-    return clamp(base - fatigue)
-
-def score_mfi(mfi: float, persist_above_80: int = 0, persist_thresh: int = 3) -> float:
-    if mfi < 30: base = 0.05
-    elif mfi < 45: base = 0.20 + 0.15 * ((mfi - 30)/15)
-    elif mfi < 55: base = 0.35 + 0.20 * ((mfi - 45)/10)
-    elif mfi < 70: base = 0.55 + 0.15 * ((mfi - 55)/15)
-    elif mfi < 80: base = 0.70 + 0.06 * ((mfi - 70)/10)
-    else: base = 0.78
-
-    fatigue = 0.0
-    if mfi >= 80:
-        frac = clamp((mfi - 80)/20)
-        if persist_above_80 < persist_thresh:
-            fatigue = 0.18 * (1 - persist_above_80/max(1,persist_thresh)) * frac
-        else:
-            fatigue = -0.03 * min(persist_above_80 - persist_thresh, 5) * frac
-    return clamp(base - fatigue)
-
-def score_macd(macd_hist: float, macd_scale: float = 0.1, k: float = 2.5) -> float:
-    return sigmoid(macd_hist / (macd_scale or 0.1), k=k)
-
-def score_williams(wr: float) -> float:
-    r = clamp(wr, -100, 0)
-    if r > -20: return 0.30
-    elif r > -40: return clamp(0.75 + 0.2 * ((r + 40)/20))
-    elif r > -70: return clamp(0.55 + 0.2 * ((r + 70)/30))
-    else: return clamp(0.40 + 0.15 * ((r + 100)/30))
-
-def score_momentum(momentum: float) -> float:
-    if momentum >= 110: return 0.95
-    elif momentum >= 105: return 0.85
-    elif momentum >= 100: return 0.65
-    elif momentum >= 95: return 0.45
-    else: return 0.20
-
-def score_vr(volume_ratio: float) -> float:
-    if volume_ratio >= 2.0: return 1.0
-    elif volume_ratio >= 1.5: return 0.9
-    elif volume_ratio >= 1.2: return 0.7
-    elif volume_ratio >= 0.9: return 0.5
-    else: return 0.25
-
-def score_ma_slope(ma_slope: float) -> float:
-    if ma_slope <= 0: return clamp(0.30 + 0.20 * (ma_slope/5))
-    elif ma_slope < 0.5: return clamp(0.50 + 0.30 * (ma_slope/0.5))
-    elif ma_slope < 1.5: return clamp(0.80 + 0.15 * ((ma_slope-0.5)/1.0))
-    else: return 1.0
-
-def compute_composite_confidence(
-    indicators: dict,
-    weights: dict = None,
-    persist_settings: dict = None,
-    macd_scale: float = 0.1,
-    atr_pct_floor: float = 0.04,
-    atr_max_penalty: float = 0.20,
-    market_bias: float = 0.0
-) -> dict:
-
-    default_weights = {
-        'macd':0.3, 'rsi':0.18, 'mfi':0.15, 'williams':0.1,
-        'momentum':0.1, 'vr':0.1, 'ma_slope':0.07
-    }
-    if weights is None:
-        weights = default_weights.copy()
-    else:
-        for k,v in default_weights.items():
-            weights.setdefault(k,v)
-
-    # 지표 점수 계산
-    rsi = indicators.get('rsi')
-    mfi = indicators.get('mfi')
-    macd_hist = indicators.get('macd_hist')
-    if macd_hist is None and indicators.get('macd') is not None and indicators.get('macd_signal') is not None:
-        macd_hist = indicators['macd'] - indicators['macd_signal']
-        
-    comps = {
-        'rsi': score_rsi(rsi, persist_above_80=persist_settings.get('rsi_persist',0) if persist_settings else 0) if rsi is not None else None,
-        'mfi': score_mfi(mfi, persist_above_80=persist_settings.get('mfi_persist',0) if persist_settings else 0) if mfi is not None else None,
-        'macd': score_macd(macd_hist, macd_scale=macd_scale) if macd_hist is not None else None,
-        'williams': score_williams(indicators['williams_r']) if indicators.get('williams_r') is not None else None,
-        'momentum': score_momentum(indicators['momentum']) if indicators.get('momentum') is not None else None,
-        'vr': score_vr(indicators['volume_ratio']) if indicators.get('volume_ratio') is not None else None,
-        'ma_slope': score_ma_slope(indicators['ma_slope']) if indicators.get('ma_slope') is not None else None
-    }
-
-    # 가중치 정규화
-    available = [(k,v,weights[k]) for k,v in comps.items() if v is not None]
-    total_w = sum(w for _,_,w in available)
-    if total_w==0: 
-        return {'confidence': 0.5, 'components': comps}
-
-    normalized = [(k,v,w/total_w) for k,v,w in available]
-    raw_conf = sum(v*w for _,v,w in normalized)
-
-    # 변동성 패널티
-    atr_pct = indicators.get('atr_pct')
-    vol_penalty = 0.0
-    if atr_pct is not None and atr_pct > atr_pct_floor:
-        vol_penalty = clamp((atr_pct - atr_pct_floor)/0.2,0,1)*atr_max_penalty
-
-    # 시장 편향 조정
-    market_adj = clamp(0.05*market_bias, -0.05, 0.05)
-    final_conf = clamp(raw_conf - vol_penalty + market_adj)
-
-    result = {
-        'confidence': round(final_conf,4),
-        'raw_confidence': round(raw_conf,4),
-        'vol_penalty': round(vol_penalty,4),
-        'market_adj': round(market_adj,4),
-        'components': {k: (None if v is None else round(v,4)) for k,v in comps.items()},
-        'used_weights': {k: round(w,4) for k,_,w in normalized}
-    }
-    return result
-
 class MarketAnalyzer:
     def __init__(self, symbol):
         self.candle = CandleInfoFetcher(symbol)
@@ -1744,44 +1691,6 @@ class MarketAnalyzer:
             return (valid_momentum[-1] / base_price) * 100
         return 100.0
 
-    def calculate_composite_confidence(self):
-        """복합 confidence 계산"""
-        rsi = self.get_rsi()
-        mfi = self.get_mfi()
-        macd_data = self.get_macd()
-        williams_r = self.get_williams_r()
-        momentum = self.get_momentum()
-        
-        # RSI 지속성 계산
-        rsi_persist = 0
-        rsi_values = talib.RSI(np.array(self.candle.trade_prices), timeperiod=14)
-        for i in range(min(5, len(rsi_values))):
-            if rsi_values[-(i+1)] >= 80:
-                rsi_persist += 1
-            else:
-                break
-
-        indicators = {
-            'rsi': rsi,
-            'mfi': mfi,
-            'macd': macd_data['macd'],
-            'macd_signal': macd_data['macd_signal'],
-            'macd_hist': macd_data['macd_hist'],
-            'williams_r': williams_r,
-            'momentum': momentum,
-            'volume_ratio': self.volume_ratio,
-            'ma_slope': self.ma_slope,
-            'atr_pct': self.atr_pct
-        }
-
-        persist_settings = {
-            'rsi_persist': rsi_persist,
-            'mfi_persist': 0
-        }
-
-        result = compute_composite_confidence(indicators, persist_settings=persist_settings)
-        return result['confidence']
-
     def is_below_ma60(self):
         return self.candle.current_price < self.ma60
 
@@ -1860,12 +1769,6 @@ class SymbolSelector:
         for rank, data in enumerate(sorted_by_volatility, 1):
             volatility_rank[data['symbol']] = rank
         
-        # confidence 순위 (높을수록 좋음 -> 낮은 순위가 좋음)
-        confidence_rank = {}
-        sorted_by_confidence = sorted(symbol_data_list, key=lambda x: x['confidence'], reverse=True)
-        for rank, data in enumerate(sorted_by_confidence, 1):
-            confidence_rank[data['symbol']] = rank
-        
         # 거래량 순위 (높을수록 좋음 -> 낮은 순위가 좋음)
         volume_rank = {}
         sorted_by_volume = sorted(symbol_data_list, key=lambda x: x['trading_volume_3h'], reverse=True)
@@ -1876,7 +1779,7 @@ class SymbolSelector:
         rank_scores = {}
         for data in symbol_data_list:
             symbol = data['symbol']
-            total_rank = volatility_rank[symbol] # + confidence_rank[symbol] + volume_rank[symbol]
+            total_rank = volatility_rank[symbol] + volume_rank[symbol]
             rank_scores[symbol] = total_rank
         
         return rank_scores
@@ -1905,8 +1808,6 @@ class SymbolSelector:
             if UpbitTickSystem.is_excluded_tick_range(analyzer.candle.current_price):
                 return None
                 
-            confidence = analyzer.calculate_composite_confidence()
-                
             return {
                 'symbol': symbol,
                 'volatility': analyzer.volatility_ratio,
@@ -1914,7 +1815,6 @@ class SymbolSelector:
                 'ma60': analyzer.ma60,
                 'rsi': analyzer.get_rsi(),
                 'mfi': analyzer.get_mfi(),
-                'confidence': confidence,
                 'below_ma60_ratio': (analyzer.ma60 - analyzer.candle.current_price) / analyzer.ma60,
                 'trading_volume_3h': trading_volume
             }
@@ -1968,7 +1868,6 @@ class SymbolSelector:
                      f"{i+1}. {symbol_data['symbol']}: "
                      f"Rank Score: {symbol_data['rank_score']} "
                      f"(Vol: {symbol_data['volatility']:.4f}, "
-                     f"Conf: {symbol_data['confidence']:.2f}, "
                      f"Vol: {symbol_data['trading_volume_3h']:,.0f}M)")
         
         best_symbol = valid_symbols[0]['symbol']
@@ -1977,10 +1876,9 @@ class SymbolSelector:
                  f"Selected symbol: {best_symbol} "
                  f"(Rank Score: {best_data['rank_score']}, "
                  f"Volatility: {best_data['volatility']:.4f}, "
-                 f"Confidence: {best_data['confidence']:.2f}, "
                  f"3H Volume: {best_data['trading_volume_3h']:,.0f}M KRW)")
         
-        return best_symbol, best_data['confidence']
+        return best_symbol
 
     @staticmethod
     def mark_symbol_as_traded(symbol):
@@ -2058,7 +1956,6 @@ if __name__=="__main__":
                     continue
                     
                 analyzer = MarketAnalyzer(symbol)
-                confidence = analyzer.calculate_composite_confidence()
             else:
                 # command.txt에서 심볼 읽기 (기존 로직)
                 symbol_from_command = None
@@ -2084,12 +1981,12 @@ if __name__=="__main__":
                         continue
                 else:
                     if args.auto_select:
-                        selection_result = SymbolSelector.select_best_symbol()
-                        if selection_result is None:
+                        selected_symbol = SymbolSelector.select_best_symbol()
+                        if selected_symbol is None:
                             print_log(LogLevel.WARNING, "No valid symbol found, waiting 30 seconds before retry...")
                             time.sleep(30)
                             continue
-                        symbol, confidence = selection_result
+                        symbol = selected_symbol
                     else:
                         symbol = "BTC"
                         if VolatilityProtector.check_volatility_protection(symbol):
@@ -2110,11 +2007,10 @@ if __name__=="__main__":
                                 continue
 
                 analyzer = MarketAnalyzer(symbol)
-                confidence = analyzer.calculate_composite_confidence()
                 trading_manager.set_symbol(symbol)
 
             print_log(LogLevel.INFO, f"=== Trading Cycle {cycle_count} ===")
-            print_log(LogLevel.INFO, f"Target Symbol: {symbol}, Confidence: {confidence:.2f}")
+            print_log(LogLevel.INFO, f"Target Symbol: {symbol}")
 
             # 매수 프로세스 시작 전 command 변경 체크
             if trading_manager.should_place_buy_orders():
@@ -2123,20 +2019,18 @@ if __name__=="__main__":
                     symbol = trading_manager.apply_pending_symbol_change()
                     print_log(LogLevel.INFO, f"Applied command override symbol: {symbol}")
                     analyzer = MarketAnalyzer(symbol)
-                    confidence = analyzer.calculate_composite_confidence()
                     
                 analyzer = MarketAnalyzer(symbol)
-                base_drop_count = 18
-                drop_count = max(base_drop_count, int(base_drop_count * (2.0 - confidence) * 0))
+                drop_count = 20
 
                 print_log(LogLevel.INFO, 
                          f"Market Analysis - RSI: {analyzer.get_rsi():.2f}, "
-                         f"Volatility: {analyzer.volatility_ratio:.4f}, Confidence: {confidence:.2f}, "
-                         f"Drop Levels: {drop_count} (base: {base_drop_count})")
+                         f"Volatility: {analyzer.volatility_ratio:.4f}, "
+                         f"Drop Levels: {drop_count}")
 
-                distribution_type = DynamicBuyOrder.DistributionType.LOG_LINEAR_I if confidence > 0.8 else DynamicBuyOrder.DistributionType.LOG_LINEAR_II if confidence < 0.3 else DynamicBuyOrder.DistributionType.PARABOLIC_II
-                dynamic_buyer = DynamicBuyOrder(symbol, analyzer.candle.current_price, S, distribution_weight, 0)
-                dynamic_buyer.calculate_order_plan(drop_percentage, drop_count, distribution_type, confidence)
+                distribution_type = DynamicBuyOrder.DistributionType.LOG_LINEAR_I
+                dynamic_buyer = DynamicBuyOrder(symbol, analyzer.candle.current_price, analyzer.candle.low_prices[-1], S, distribution_weight, 0)
+                dynamic_buyer.calculate_order_plan(drop_percentage, drop_count, distribution_type)
 
                 # 동적 매수 실행
                 if dynamic_buyer.execute_dynamic_buy_orders():
@@ -2202,6 +2096,8 @@ if __name__=="__main__":
                         else:
                             # 보유량이 없으면 거래 완료
                             if trading_manager.buy_orders_executed:
+                                sell_uuids.clear()
+
                                 print_log(LogLevel.SUCCESS, "No holdings left - trading completed")
                                 trading_manager.mark_sell_orders_executed()
                                 trading_completed = True
@@ -2221,7 +2117,7 @@ if __name__=="__main__":
                         print_log(LogLevel.INFO, f"Current trading completed. Will switch to new symbol '{new_symbol}' in next cycle.")
 
                 log_state(LogState.BUYING, symbol)
-                print_log(LogLevel.INFO, f"Buy orders placed for '{symbol}' with confidence {confidence:.2f}")
+                print_log(LogLevel.INFO, f"Buy orders placed for '{symbol}'")
                 threading.Thread(target=winsound.Beep, args=(440, 500)).start()
 
             # 거래 완료 처리
@@ -2230,7 +2126,6 @@ if __name__=="__main__":
                     SymbolSelector.mark_symbol_as_traded(symbol)
                 
                 OrderCanceler().cancel_buy_orders()
-                OrderCanceler().cancel_sell_orders()
                 
                 if trading_manager.stop_loss_triggered:
                     print_log(LogLevel.WARNING, "Trading completed due to stop loss")
