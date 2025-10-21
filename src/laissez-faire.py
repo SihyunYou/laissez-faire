@@ -2021,7 +2021,7 @@ if __name__=="__main__":
                     analyzer = MarketAnalyzer(symbol)
                     
                 analyzer = MarketAnalyzer(symbol)
-                drop_count = 20
+                drop_count = 18
 
                 print_log(LogLevel.INFO, 
                          f"Market Analysis - RSI: {analyzer.get_rsi():.2f}, "

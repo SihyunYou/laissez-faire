@@ -2,7 +2,6 @@ key.txt
 profit_*.txt
 __pycache__
 zNex~*
-log/
 build/
 dist/
 ChatEtChien/.vs/
