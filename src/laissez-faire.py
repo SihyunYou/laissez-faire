@@ -1535,8 +1535,8 @@ class SellController:
         OrderCanceler().cancel_sell_orders()
 
     def place_sell_orders(self, symbol, profit_percentages, dynamic_buyer=None):
-        """매도 주문 걸기 — 매수 최저가 기준 (평단가 아님).
-        dynamic_buyer.executed_orders 에서 매수 최저가를 추출.
+        """매도 주문 걸기 — 매수 평단가 기준.
+        매도가는 무조건 평단가보다 위여야 이득 (매수 최저가 기준은 평단가 대비 손실).
         locked(이미 매도 주문에 잠긴 수량)은 포함하지 않아 insufficient_funds_ask 방지."""
         try:
             available_volume = self.get_available_volume(symbol)
@@ -1545,19 +1545,12 @@ class SellController:
                 print_log(LogLevel.WARNING, f"매도 불가 - 부족한 수량: {available_volume:.6f}")
                 return False
 
-            # 매도 기준가 결정 — 매수 최저가 우선, 폴백으로 평단가 사용
-            sell_base_price = None
-            if dynamic_buyer and dynamic_buyer.executed_orders:
-                executed_prices = [o['executed_price'] for o in dynamic_buyer.executed_orders
-                                   if o.get('executed_price', 0) > 0]
-                if executed_prices:
-                    sell_base_price = min(executed_prices)  # 매수 최저가
-                    print_log(LogLevel.INFO,
-                              f"매도 기준가 = 매수 최저가 {sell_base_price:,.4f} "
-                              f"(체결 매수 {len(executed_prices)}건)")
-            if sell_base_price is None or sell_base_price <= 0:
-                sell_base_price = self.get_avg_buy_price(symbol)
-                print_log(LogLevel.INFO, f"매도 기준가 = 평단가 {sell_base_price:,.0f} (폴백)")
+            # 매도 기준가 = 매수 평단가 (업비트 /v1/accounts avg_buy_price)
+            sell_base_price = self.get_avg_buy_price(symbol)
+            if sell_base_price <= 0:
+                print_log(LogLevel.WARNING, f"매도 불가 - 평단가 조회 실패: {sell_base_price}")
+                return False
+            print_log(LogLevel.INFO, f"매도 기준가 = 평단가 {sell_base_price:,.4f}")
 
             print_log(LogLevel.INFO, f"매도주문 - 기준가: {sell_base_price:,.4f}, 매도가능수량: {available_volume:.6f}")
 
@@ -1707,8 +1700,8 @@ class SellController:
 
     def check_sell_fills(self, symbol, dynamic_buyer):
         """매도 per-order 체결 확인 — 체결된 매도는 되받은 KRW만큼
-        다음 매수 지점(미체결 다음 레벨)에 추가 투자.
-        추적 중인 매도 전체가 체결되면 True(사이클 완료) 반환."""
+        잠재 매수 예산에 가산. 추적 중인 매도 전체가 체결되면 True(사이클 완료) 반환.
+        수동 취소된 매도는 tracking에서 제거만 하고 사이클 종료로 간주하지 않음."""
         if not self.sell_orders_tracking:
             return False
 
@@ -1740,12 +1733,28 @@ class SellController:
                 if order_info and order_info.get('state') == 'done':
                     entry['filled'] = True
                     self.filled_sell_count += 1
+                    # 체결된 매도 UUID를 sell_uuids에서 제거 — has_pending_sell_orders 갱신
+                    if entry['uuid'] in sell_uuids:
+                        sell_uuids.remove(entry['uuid'])
                     executed_vol = float(order_info.get('executed_volume', entry['volume']))
                     sell_price = entry['price']
                     rebuy_krw = executed_vol * sell_price  # 매도로 되받은 KRW
 
-                    # 다음 매수 지점(미체결 다음 레벨)에 추가 투자
+                    print_log(LogLevel.SUCCESS,
+                              f"✅ 매도#{entry['tier']} 체결 확인 (수량 {executed_vol:.6f} @ {sell_price:,.4f}원)")
+                    # 잠재 매수 예산에 되받은 KRW 가산
                     self._reinvest_to_next_buy(dynamic_buyer, rebuy_krw, entry['tier'])
+                elif order_info and order_info.get('state') == 'cancel':
+                    # 외부(업비트 앱/웹)에서 수동 취소된 매도.
+                    # 사이클을 종료하지 않고 — tracking/uuid에서만 제거하여 다음 루프에서
+                    # has_pending_sell_orders=False → 새 매도 자동 재설정.
+                    print_log(LogLevel.WARNING,
+                              f"⚠ 매도#{entry['tier']} 가 수동 취소됨 — tracking 제거, "
+                              f"다음 루프에서 새 매도 재설정 (사이클 유지)")
+                    entry['filled'] = True  # 이 entry는 더 이상 조회하지 않음
+                    if entry['uuid'] in sell_uuids:
+                        sell_uuids.remove(entry['uuid'])
+                    all_filled = False  # ★ 수동 취소는 사이클 종료 아님
                 else:
                     all_filled = False
             except Exception as e:
@@ -1829,36 +1838,16 @@ class SellController:
             available_volume = self.get_available_volume(symbol)
             if available_volume >= MIN_HOLDING_VOLUME:
                 print_log(LogLevel.INFO, f"매도주문 없음 - 새 매도주문 걸기 (매도가능수량: {available_volume:.6f})")
+                # 추적 상태 정리 (이전 라운드 잔여 방지)
+                self.sell_orders_tracking = [e for e in self.sell_orders_tracking if not e['filled']]
                 if self.place_sell_orders(symbol, profit_percentages, dynamic_buyer):
                     trading_manager.mark_sell_orders_placed()
             else:
-                print_log(LogLevel.WARNING, f"매도주문 걸기 실패 - 부족한 수량: {available_volume:.6f}")
+                # 매도 가능 수량이 없으면 locked(미체결 매도)가 있는지 확인
+                total_vol = self.get_total_volume(symbol)
+                if total_vol < MIN_HOLDING_VOLUME:
+                    print_log(LogLevel.WARNING, f"매도 불가 - 총 수량 부족: {total_vol:.6f}")
             return False
-
-        # 매도 주문이 걸려있는 상태 — 매수 평균가(최저가) 변경 감지
-        # 평단가/최저가가 바뀌었으면 기존 매도 취소 후 새 기준가로 재설정
-        current_base = None
-        if dynamic_buyer and dynamic_buyer.executed_orders:
-            executed_prices = [o['executed_price'] for o in dynamic_buyer.executed_orders
-                               if o.get('executed_price', 0) > 0]
-            if executed_prices:
-                current_base = min(executed_prices)
-        if current_base is None or current_base <= 0:
-            current_base = self.get_avg_buy_price(symbol)
-
-        if self.last_sell_base_price is not None and abs(current_base - self.last_sell_base_price) > 0.000001:
-            print_log(LogLevel.INFO,
-                      f"📉 매도 기준가 변경 감지: {self.last_sell_base_price:,.4f} → {current_base:,.4f} "
-                      f"— 기존 매도 취소 후 재설정")
-            # 기존 매도 추적/UUID 초기화
-            self.sell_orders_tracking = []
-            self.filled_sell_count = 0
-            self.cancel_all_sell_orders(symbol)
-            # 새 기준가로 매도 재설정
-            available_volume = self.get_available_volume(symbol)
-            if available_volume >= MIN_HOLDING_VOLUME:
-                if self.place_sell_orders(symbol, profit_percentages, dynamic_buyer):
-                    print_log(LogLevel.SUCCESS, "매도주문 갱신 완료 (새 기준가)")
 
         return False
 
