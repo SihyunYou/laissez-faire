@@ -23,6 +23,13 @@ from talib import MA_Type
 import hmac
 import random
 
+# 웹소켓 라이브러리 (선택) — 미설치 시 REST 폴백
+try:
+    import websocket
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+
 init(autoreset=True)
 
 # Configuration
@@ -196,15 +203,118 @@ class UpbitTickSystem:
 
         return sorted(prices)
 
+class UpbitWebSocket:
+    """업비트 ticker 웹소켓 스트림 — 백그라운드 스레드로 최신가 수신/캐싱.
+    REST polling(GET /v1/ticker)을 대체하여 API 호출 없이 실시간 시세 제공."""
+    WS_URL = "wss://api.upbit.com/websocket/v1"
+    CACHE_TTL = 5.0  # 캐시 만료 시간(초) — 이 지나면 REST 폴백
+
+    def __init__(self):
+        self.ws = None
+        self.thread = None
+        self.price_cache = {}        # {symbol: latest_price}
+        self.cache_timestamp = {}    # {symbol: timestamp}
+        self.current_symbol = None
+        self.is_connected = False
+        self._should_reconnect = True
+
+    def subscribe(self, symbol):
+        """심볼 구독 시작. 기존 연결이 있으면 종료 후 새 심볼로 재연결."""
+        if self.current_symbol == symbol and self.is_connected:
+            return  # 이미 같은 심볼 구독 중
+        self.current_symbol = symbol
+        # 기존 연결 종료
+        self._should_reconnect = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except:
+                pass
+        # 새 연결 시작
+        self._should_reconnect = True
+        self.thread = threading.Thread(target=self._connect_loop, daemon=True)
+        self.thread.start()
+        print_log(LogLevel.INFO, f"WebSocket ticker 구독 시작: KRW-{symbol}")
+
+    def get_price(self, symbol):
+        """캐시에서 최신가 조회. 캐시 만료 시 None 반환(호출자가 REST 폴백)."""
+        if symbol not in self.price_cache:
+            return None
+        ts = self.cache_timestamp.get(symbol, 0)
+        if (datetime.now().timestamp() - ts) > self.CACHE_TTL:
+            return None  # 만료 — REST 폴백
+        return self.price_cache[symbol]
+
+    def _connect_loop(self):
+        """백그라운드 스레드 — 재연결 루프."""
+        backoff = 1
+        while self._should_reconnect and self.current_symbol:
+            try:
+                self.ws = websocket.WebSocketApp(
+                    self.WS_URL,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close
+                )
+                self.ws.run_forever(ping_interval=60, ping_timeout=10)
+            except Exception as e:
+                print_log(LogLevel.WARNING, f"WebSocket 연결 오류: {str(e)}")
+            # 재연결 대기
+            if self._should_reconnect:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)  # 최대 30초
+
+    def _on_open(self, ws):
+        self.is_connected = True
+        code = f"KRW-{self.current_symbol}"
+        req = [{"ticket": f"laissez-faire-{int(time.time())}"},
+               {"type": "ticker", "codes": [code]}]
+        ws.send(json.dumps(req))
+        print_log(LogLevel.SUCCESS, f"WebSocket 연결 성공 — {code} ticker 수신 대기")
+
+    def _on_message(self, ws, message):
+        """ticker 메시지 파싱 → 캐시 갱신."""
+        try:
+            data = json.loads(message.decode('utf-8')) if isinstance(message, (bytes, bytearray)) else json.loads(message)
+            code = data.get('code', '')
+            if code.startswith('KRW-'):
+                symbol = code[4:]
+                price = data.get('trade_price')
+                if price:
+                    self.price_cache[symbol] = float(price)
+                    self.cache_timestamp[symbol] = datetime.now().timestamp()
+        except Exception as e:
+            pass  # 파싱 오류는 조용히 무시
+
+    def _on_error(self, ws, error):
+        self.is_connected = False
+        print_log(LogLevel.WARNING, f"WebSocket 에러: {str(error)[:100]}")
+
+    def _on_close(self, ws, close_status, close_msg):
+        self.is_connected = False
+        if self._should_reconnect:
+            print_log(LogLevel.INFO, "WebSocket 연결 종료 — 재연결 대기")
+
+
 class RealMarketData:
+    # 웹소켓 싱글톤 (라이브러리 사용 가능 시만)
+    _ws = UpbitWebSocket() if WEBSOCKET_AVAILABLE else None
+
     @staticmethod
     def get_current_price(symbol):
+        # 웹소켓 캐시 우선 (핫 루프 최적화 — API 호출 없음)
+        if RealMarketData._ws:
+            cached = RealMarketData._ws.get_price(symbol)
+            if cached is not None:
+                return cached
+        # 폴백: 기존 REST 코드 (웹소켓 미가동/캐시 만료 시)
         try:
             def api_call():
                 url = f"{TICKER_URL}?markets=KRW-{symbol}"
                 headers = {"Accept": "application/json"}
                 response = requests.get(url, headers=headers, timeout=10)
-                
+
                 if response.status_code == 200:
                     data = response.json()
                     if data and len(data) > 0:
@@ -216,11 +326,17 @@ class RealMarketData:
                 else:
                     print_log(LogLevel.WARNING, f"Failed to get current price: {response.status_code}")
                     return None
-            
+
             return safe_api_call(api_call)
         except Exception as e:
             print_log(LogLevel.EXCEPTION, f"Error getting current price: {str(e)}")
             return None
+
+    @staticmethod
+    def subscribe_websocket(symbol):
+        """웹소켓 구독 시작 (심볼 확정 시 호출)."""
+        if RealMarketData._ws:
+            RealMarketData._ws.subscribe(symbol)
 
 class RateLimiter:
     def __init__(self, interval):
@@ -2242,6 +2358,9 @@ if __name__=="__main__":
             print_log(LogLevel.INFO, f"=== Trading Cycle {cycle_count} ===")
             print_log(LogLevel.INFO, f"Target Symbol: {symbol}")
 
+            # 웹소켓 ticker 구독 (심볼 확정 시)
+            RealMarketData.subscribe_websocket(symbol)
+
             # 매수 프로세스 시작 전 command 변경 체크
             if trading_manager.should_place_buy_orders():
                 # command 오버라이드가 있으면 즉시 적용 (새로운 거래 시작 시에만)
@@ -2378,7 +2497,7 @@ if __name__=="__main__":
                      f"Cycle {cycle_count} Result - Profit/Loss: {profit_loss:+,} KRW ({datetime.now() - START_TIME})")
 
             log_balance(S)
-            S = int(S)  # 수수료 사전 공제 제거 — 벌은 돈 포함 잔액 전액 재투자
+            S = int(S)
             
             trading_manager.reset()
             print_log(LogLevel.INFO, f"Cycle {cycle_count} completed. Waiting for next cycle...")
