@@ -40,6 +40,12 @@ MIN_ORDER_AMOUNT = 5000
 MIN_HOLDING_VOLUME = 0.0001  # 최소 보유 수량
 STOP_LOSS_PERCENTAGE = -20.0  # 스탑로스 -20%
 
+# 다중 분할매수 설정 — 단일 주문을 N개 가격으로 쪼개어 POST.
+# SPLIT_ORDER_COUNT=1 이면 분할 없이 기존 단일 주문 동작.
+# 분할 시 각 주문 금액이 MIN_ORDER_AMOUNT(5000원) 미만이면 자동으로 단일 폴백.
+SPLIT_ORDER_COUNT = 3        # 분할 주문 개수 (3=삼중, 4=사중...)
+SPLIT_STEP_PERCENT = 0.2     # 분할 가격 간격 (%). 기준가 중심 대칭: -0.2%, 0%, +0.2%
+
 # Global state
 InitialBalance = 0
 buy_uuids = []
@@ -95,126 +101,55 @@ def log_state(state, additional_info=''):
         pass
 
 class UpbitTickSystem:
+    # 업비트 KRW 마켓 호가 단위 테이블 (2025-07-31 변경 정책 반영)
+    # 출처: 업비트 개발자센터 / 고객센터 거래 이용 안내 (공식)
+    # https://docs.upbit.com/kr/changelog/krw_tick_unit_change_250731
+    # https://support.upbit.com/hc/ko/articles/4403838454809
+    # (하한가, 호가단위) 쌍의 리스트 — 하한가 이상인 첫 구간의 호가단위를 사용.
+    TICK_TABLE = [
+        (2000000,    1000),  # 2,000,000원 이상
+        (1000000,    1000),  # 1,000,000원 이상 ~ 2,000,000원 미만
+        (500000,      500),  #   500,000원 이상 ~ 1,000,000원 미만
+        (100000,      100),  #   100,000원 이상 ~   500,000원 미만
+        (50000,        50),  #    50,000원 이상 ~   100,000원 미만
+        (10000,        10),  #    10,000원 이상 ~    50,000원 미만
+        (5000,          5),  #     5,000원 이상 ~    10,000원 미만
+        (1000,          1),  #     1,000원 이상 ~     5,000원 미만
+        (100,           1),  #       100원 이상 ~     1,000원 미만
+        (10,          0.1),  #        10원 이상 ~       100원 미만
+        (1,          0.01),  #         1원 이상 ~        10원 미만
+        (0.1,        0.001), #       0.1원 이상 ~         1원 미만
+        (0.01,      0.0001), #      0.01원 이상 ~       0.1원 미만
+        (0.001,    0.00001), #     0.001원 이상 ~      0.01원 미만
+        (0.0001,  0.000001), #    0.0001원 이상 ~     0.001원 미만
+        (0.00001, 0.0000001),#   0.00001원 이상 ~    0.0001원 미만
+        (0,       0.00000001),# 0.00001원 미만
+    ]
+
     @staticmethod
     def get_minimum_tick(price):
-        t = price
-    
-        if t >= 2000000:
-            t = 1000
-        elif t >= 1000000:
-            t = 1000
-        elif t >= 500000:
-            t = 500
-        elif t >= 100000:
-            t = 100
-        elif t >= 50000:
-            t = 50
-        elif t >= 10000:
-            t = 10
-        elif t >= 5000:
-            t = 5
-        elif t >= 1000:
-            t = 1
-        elif t >= 100:
-            t = 1
-        elif t >= 10:
-            t = 0.1
-        elif t >= 1:
-            t = 0.01
-        elif t >= 0.1:
-            t = 0.001
-        elif t >= 0.01:
-            t = 0.0001
-        elif t >= 0.0001:
-            t = 0.000001
-        elif t >= 0.00001:
-            t = 0.0000001
-        else:
-            t = 0.00000001
-    
-        return t
+        for lower_bound, tick in UpbitTickSystem.TICK_TABLE:
+            if price >= lower_bound:
+                return tick
+        return UpbitTickSystem.TICK_TABLE[-1][1]
 
     @staticmethod
     def round_down(price, proportion):
         t = price - (price / 100) * proportion
-    
-        if t >= 2000000:
-            t = math.floor(t / 1000) * 1000
-        elif t >= 1000000:
-            t = math.floor(t / 1000) * 1000
-        elif t >= 500000:
-            t = math.floor(t / 500) * 500
-        elif t >= 100000:
-            t = math.floor(t / 100) * 100
-        elif t >= 50000:
-            t = math.floor(t / 50) * 50
-        elif t >= 10000:
-            t = math.floor(t / 10) * 10
-        elif t >= 5000:
-            t = math.floor(t / 5) * 5
-        elif t >= 1000:
-            t = math.floor(t / 1) * 1
-        elif t >= 100:
-            t = math.floor(t / 1) * 1
-        elif t >= 10:
-            t = math.floor(t / 0.1) * 0.1
-        elif t >= 1:
-            t = math.floor(t / 0.01) * 0.01
-        elif t >= 0.1:
-            t = math.floor(t / 0.001) * 0.001
-        elif t >= 0.01:
-            t = math.floor(t / 0.0001) * 0.0001
-        elif t >= 0.0001:
-            t = math.floor(t / 0.000001) * 0.000001
-        elif t >= 0.00001:
-            t = math.floor(t / 0.0000001) * 0.0000001
-        else:
-            t = math.floor(t / 0.00000001) * 0.00000001
-    
-        return t
+        tick = UpbitTickSystem.get_minimum_tick(t)
+        return math.floor(t / tick) * tick
 
     @staticmethod
     def round_up(price):
         t = price
-    
-        if t >= 2000000:
-            t = math.ceil(t / 1000) * 1000
-        elif t >= 1000000:
-            t = math.ceil(t / 1000) * 1000
-        elif t >= 500000:
-            t = math.ceil(t / 500) * 500
-        elif t >= 100000:
-            t = math.ceil(t / 100) * 100
-        elif t >= 50000:
-            t = math.ceil(t / 50) * 50
-        elif t >= 10000:
-            t = math.ceil(t / 10) * 10
-        elif t >= 5000:
-            t = math.ceil(t / 5) * 5
-        elif t >= 1000:
-            t = math.ceil(t / 1) * 1
-        elif t >= 100:
-            t = math.ceil(t / 1) * 1
-        elif t >= 10:
-            t = math.ceil(t / 0.1) * 0.1
-        elif t >= 1:
-            t = math.ceil(t / 0.01) * 0.01
-        elif t >= 0.1:
-            t = math.ceil(t / 0.001) * 0.001
-        elif t >= 0.01:
-            t = math.ceil(t / 0.0001) * 0.0001
-        elif t >= 0.0001:
-            t = math.ceil(t / 0.000001) * 0.000001
-        elif t >= 0.00001:
-            t = math.ceil(t / 0.0000001) * 0.0000001
-        else:
-            t = math.ceil(t / 0.00000001) * 0.00000001
-    
-        return t
+        tick = UpbitTickSystem.get_minimum_tick(t)
+        return math.ceil(t / tick) * tick
     
     @staticmethod
     def calculate_sell_price(avg_buy_price, profit_percentage):
-        required_price = avg_buy_price * (1 + profit_percentage / 100) / COMMISSION
+        # 수수료 보전 제거 — 단순히 평단가 × (1 + 목표수익률%).
+        # 수수료(매수+매도 0.10%)는 체결 시 업비트가 부과하므로 여기서 반영하지 않음.
+        required_price = avg_buy_price * (1 + profit_percentage / 100)
         return UpbitTickSystem.round_up(required_price)
     
     @staticmethod
@@ -226,6 +161,40 @@ class UpbitTickSystem:
         if price < 2.70:
             return True
         return False
+
+    @staticmethod
+    def generate_split_prices(base_price, count, step_pct):
+        """base_price 를 중심으로 count 개의 가격을 step_pct 간격(대칭)으로 생성.
+        각각 호가단위로 snap. snap 결과 중복 가격이 생기면 분할이 의미 없으므로
+        분할 금지 → [base_price] 만 반환 (단일 주문 폴백).
+        Returns: list[float]
+        - count 홀수: 중심 포함 대칭 (예: 3 -> [-0.25%, 0%, +0.25%])
+        - count 진수: 중심 양옆 반칸 (예: 4 -> [-0.375%, -0.125%, +0.125%, +0.375%])"""
+        if count <= 1:
+            return [base_price]
+
+        # 대칭 offset(%) 생성
+        if count % 2 == 1:
+            half = (count - 1) // 2
+            offsets = [(-half + i) * step_pct for i in range(count)]
+        else:
+            half = count // 2
+            offsets = [(-half + i + 0.5) * step_pct for i in range(count)]
+
+        # offset 적용 → 호가단위 snap (가장 가까운 호가로 반올림)
+        prices = []
+        for off in offsets:
+            raw = base_price * (1 + off / 100.0)
+            tk = UpbitTickSystem.get_minimum_tick(raw)
+            snapped = round(raw / tk) * tk
+            prices.append(snapped)
+
+        # 호가 snap 후 중복 가격이 있으면 분할이 무의미 → 분할 금지, 단일 폴백
+        # 예: 150원(호가 1원) 3중분할 → 149.625/150/150.375 → snap → 150/150/150 → 중복 → 금지
+        if len(set(prices)) < count:
+            return [base_price]
+
+        return sorted(prices)
 
 class RealMarketData:
     @staticmethod
@@ -270,22 +239,23 @@ class RateLimiter:
 rate_limiter = RateLimiter(SLEEP_TIME)
 
 def safe_api_call(func, *args, **kwargs):
-    max_retries = 3
-    
-    for attempt in range(max_retries):
+    """네트워크 오류 시 무한 재시도 — 프로그램이 종료되지 않고 복구 대기.
+    백오프는 지수(exponential)로 증가하되 최대 30초로 상한."""
+    max_backoff = 30.0
+    attempt = 0
+
+    while True:
         try:
             rate_limiter.acquire()
             result = func(*args, **kwargs)
             return result
-            
+
         except requests.exceptions.RequestException as e:
-            if attempt < max_retries - 1:
-                wait_time = SLEEP_TIME * (2 ** attempt)
-                print_log(LogLevel.WARNING, f"API call failed (attempt {attempt + 1}), retrying in {wait_time:.2f}s: {str(e)}")
-                time.sleep(wait_time)
-            else:
-                print_log(LogLevel.ERROR, f"API call failed after {max_retries} attempts: {str(e)}")
-                raise e
+            wait_time = min(SLEEP_TIME * (2 ** attempt), max_backoff)
+            attempt += 1
+            print_log(LogLevel.WARNING,
+                      f"API call failed (attempt {attempt}), retrying in {wait_time:.2f}s: {str(e)}")
+            time.sleep(wait_time)
 
 
 
@@ -319,7 +289,7 @@ class OrderCanceler:
     def cancel_all_orders(self, cancel_type):
         params = {'state': 'wait'}
         query_string = unquote(urlencode(params, doseq=True)).encode("utf-8")
-        
+
         m = hashlib.sha512()
         m.update(query_string)
         query_hash = m.hexdigest()
@@ -338,7 +308,7 @@ class OrderCanceler:
         def api_call():
             response = requests.get(SERVER_URL + '/v1/orders', params=params, headers=headers)
             return response.json()
-        
+
         try:
             response_dict = safe_api_call(api_call)
         except Exception as e:
@@ -370,16 +340,16 @@ class OrderCanceler:
                 if isinstance(order, dict):
                     if self.cancel_order(order.get('uuid')):
                         cancelled_count += 1
-        
+
         print_log(LogLevel.INFO, f"Cancelled {cancelled_count} orders (type: {cancel_type})")
 
     def cancel_order(self, order_uuid):
         if not order_uuid:
             return False
-            
+
         params = {'uuid': order_uuid}
         query_string = unquote(urlencode(params, doseq=True)).encode("utf-8")
-        
+
         m = hashlib.sha512()
         m.update(query_string)
         query_hash = m.hexdigest()
@@ -395,21 +365,23 @@ class OrderCanceler:
         authorization = f'Bearer {jwt_token}'
         headers = {"Authorization": authorization, "Accept": "application/json"}
 
-        def api_call():
-            response = requests.delete(SERVER_URL + "/v1/order", params=params, headers=headers)
-            return response
-        
+        # 1회 시도 후 실패하면 그냥 패스 (재시도 없음)
         try:
+            def api_call():
+                response = requests.delete(SERVER_URL + "/v1/order", params=params, headers=headers)
+                return response
+
             response = safe_api_call(api_call)
             if response.status_code == 200:
                 print_log(LogLevel.INFO, f"Successfully cancelled order: {order_uuid}")
                 return True
             else:
-                print_log(LogLevel.WARNING, f"Failed to cancel order {order_uuid}: {response.status_code}")
-                return False
+                # 400/401/404 등 — 이미 체결/취소/없는 주문은 그냥 패스
+                print_log(LogLevel.INFO, f"Order {order_uuid} cancel skipped ({response.status_code})")
+                return True
         except Exception as e:
-            print_log(LogLevel.ERROR, f"Error cancelling order {order_uuid}: {str(e)}")
-            return False
+            print_log(LogLevel.WARNING, f"Cancel error {order_uuid}: {str(e)} — skipped")
+            return True
 
 class AccountChecker:
     def __init__(self):
@@ -518,9 +490,65 @@ class DynamicBuyOrder:
             self._calculate_fibonacci_plan(drop_percentage, drop_count)
         else:
             self._calculate_linear_plan(drop_percentage, drop_count)
-        
+
+        # 분할매수 적용 시 각 레벨을 '이전 레벨 분할 최저가' 기준으로 재계산
+        self._adjust_to_split_lowest_base(drop_percentage)
+
+        # 인접 주문 가격 중복 시 호가 최소단위만큼 강제 하락 (예: 150/150 → 150/149)
+        self._enforce_min_tick_gap()
+
         self.original_planned_orders = [order.copy() for order in self.active_planned_orders]
         print_log(LogLevel.SUCCESS, f"Calculated {len(self.active_planned_orders)} buy orders for {self.symbol} based on low price {self.low_price:.4f}")
+
+    def _adjust_to_split_lowest_base(self, drop_percentage):
+        """다중 분할매수(SPLIT_ORDER_COUNT>1)일 때, 각 레벨의 기준가를
+        '이전 레벨 분할의 최저가'를 출발점으로 재계산.
+        분할 최저가 = planned_price * (1 - 하단 최대 offset%).
+        레벨 n+1 의 간격은 레벨 n 의 분할 최저가에서 drop%*height_weight 만큼 하락.
+        SPLIT_ORDER_COUNT<=1 이면 아무 것도 하지 않음(기존 동작)."""
+        if SPLIT_ORDER_COUNT <= 1 or not self.active_planned_orders:
+            return
+
+        # 분할 하단 최대 offset(%). 3중 분할 대칭 → -0.25%.
+        if SPLIT_ORDER_COUNT % 2 == 1:
+            half = (SPLIT_ORDER_COUNT - 1) // 2
+        else:
+            half = SPLIT_ORDER_COUNT // 2
+        low_offset_pct = half * SPLIT_STEP_PERCENT
+
+        weight = self.weight
+        # 첫 레벨은 그대로, 이후 레벨은 직전 분할 최저가에서 간격만큼 하락
+        curr_base = self.active_planned_orders[0]['planned_price']
+        for i in range(1, len(self.active_planned_orders)):
+            order = self.active_planned_orders[i]
+            n = order['level']
+            height_weight = 1 + weight * (n - 1)
+            # 이전 레벨의 분할 최저가(예상) — 직전 planned_price 기준
+            prev_planned = self.active_planned_orders[i - 1]['planned_price']
+            prev_split_lowest = prev_planned * (1 - low_offset_pct / 100.0)
+            # 출발점(prev_split_lowest)에서 drop%*hw 만큼 하락한 가격을 새 기준가로
+            new_price = UpbitTickSystem.round_down(prev_split_lowest, drop_percentage * height_weight)
+            order['planned_price'] = new_price
+            order['original_planned_price'] = new_price
+            order['volume'] = order['quantity'] / new_price if new_price > 0 else 0
+
+    def _enforce_min_tick_gap(self):
+        """인접 분할 매수 주문이 같은 가격(또는 더 높은 가격)이면, n+1번째를
+        직전 가격에서 호가 최소단위 1개만큼 낮춰 강제 하락시킨다.
+        예: 150원 코인(호가 1원)에서 [150, 150] → [150, 149]."""
+        for i in range(1, len(self.active_planned_orders)):
+            prev = self.active_planned_orders[i - 1]
+            curr = self.active_planned_orders[i]
+            if curr['planned_price'] >= prev['planned_price']:
+                tick = UpbitTickSystem.get_minimum_tick(prev['planned_price'])
+                new_price = prev['planned_price'] - tick
+                old_price = curr['planned_price']
+                curr['planned_price'] = new_price
+                curr['original_planned_price'] = new_price
+                curr['volume'] = curr['quantity'] / new_price if new_price > 0 else 0
+                print_log(LogLevel.INFO,
+                          f"Enforced min tick gap at level {curr['level']}: "
+                          f"{old_price} -> {new_price} (tick={tick})")
 
     def _calculate_linear_plan(self, drop_percentage, drop_count):
         total_weight = sum(range(1, drop_count + 1))
@@ -646,11 +674,11 @@ class DynamicBuyOrder:
                 if gap > required_shift:
                     required_shift = gap
         
-        # 최소 밀림량 체크 (티커 단위)
-        min_shift = 0.0001  # 기본 틱 사이즈
+        # 최소 밀림량 체크 (현재 심볼의 호가단위 기준 — 7/31 호가정책 반영)
+        min_shift = UpbitTickSystem.get_minimum_tick(self.low_price) if self.low_price else 0.0001
         if required_shift < min_shift:
             return 0.0
-            
+
         return required_shift
 
     def _apply_plan_shift(self, shift_amount):
@@ -786,35 +814,62 @@ class DynamicBuyOrder:
         return False
 
     def _execute_single_order(self, order):
-        """단일 주문 실행"""
+        """주문 실행 — 다중 분할매수(SPLIT_ORDER_COUNT) 지원.
+        기준가(planned_price)를 N개 가격으로 쪼개어 각각 POST.
+        각 주문 금액이 MIN_ORDER_AMOUNT 미만이면 분할 금지하고 단일 주문으로 폴백."""
         current_price = RealMarketData.get_current_price(self.symbol)
         if not current_price:
             return False
 
         order_price = order['planned_price']
         order_volume = order['volume']
-        
-        print_log(LogLevel.INFO, 
+
+        # 분할 가격 생성 (기준가 중심 대칭, 호가 snap, 중복 시 강제 분리)
+        split_prices = UpbitTickSystem.generate_split_prices(
+            order_price, SPLIT_ORDER_COUNT, SPLIT_STEP_PERCENT)
+
+        # 최소주문금액 검사 — 분할 시 각 주문이 5000원 미만이면 분할 금지(단일 폴백)
+        per_volume = order_volume / len(split_prices) if split_prices else order_volume
+        per_amount = per_volume * order_price
+        if per_amount < MIN_ORDER_AMOUNT and len(split_prices) > 1:
+            print_log(LogLevel.INFO,
+                      f"Order {order['level']} split skipped — per-order amount "
+                      f"{per_amount:,.0f} KRW < {MIN_ORDER_AMOUNT} (단일 주문으로 폴백)")
+            split_prices = [order_price]
+            per_volume = order_volume
+
+        print_log(LogLevel.INFO,
                  f"🎯 Executing order {order['level']} - "
-                 f"Price: {order_price:.4f} KRW, "
-                 f"Volume: {order_volume:.6f}")
-        
-        order_uuid = self.place_dynamic_buy_order(order_price, order_volume)
-        if order_uuid:
-            pending_order = {
-                'level': order['level'],
-                'planned_price': order['planned_price'],
-                'actual_price': order_price,
-                'volume': order_volume,
-                'order_time': datetime.now(),
-                'uuid': order_uuid
-            }
-            
-            self.pending_orders.append(pending_order)
-            print_log(LogLevel.SUCCESS, f"✅ Order {order['level']} placed")
+                 f"Base Price: {order_price:.4f} KRW, "
+                 f"Total Volume: {order_volume:.6f}, "
+                 f"Split: {len(split_prices)} (per {per_volume:.6f} @ {[round(p,8) for p in split_prices]})")
+
+        # 각 가격으로 주문 POST, 성공한 만큼 pending_orders 에 개별 추적
+        success_count = 0
+        for idx, sp in enumerate(split_prices):
+            order_uuid = self.place_dynamic_buy_order(sp, per_volume)
+            if order_uuid:
+                pending_order = {
+                    'level': order['level'],
+                    'planned_price': order['planned_price'],
+                    'actual_price': sp,
+                    'volume': per_volume,
+                    'order_time': datetime.now(),
+                    'uuid': order_uuid,
+                    'split_idx': idx,
+                    'split_total': len(split_prices),
+                }
+                self.pending_orders.append(pending_order)
+                success_count += 1
+            else:
+                print_log(LogLevel.ERROR, f"❌ Failed to place split order {order['level']}-{idx+1}/{len(split_prices)}")
+
+        if success_count > 0:
+            print_log(LogLevel.SUCCESS,
+                      f"✅ Order {order['level']} placed ({success_count}/{len(split_prices)} splits)")
             return True
         else:
-            print_log(LogLevel.ERROR, f"❌ Failed to place order {order['level']}")
+            print_log(LogLevel.ERROR, f"❌ Failed to place order {order['level']} (all splits failed)")
             return False
 
     def _is_order_executed(self, pending_order):
@@ -1114,6 +1169,7 @@ class DynamicBuyOrder:
 class SellOrder:
     def __init__(self, symbol, volume, price):
         global sell_uuids
+        self.uuid = None  # 체결 추적용 — 성공 시 UUID 저장
 
         query = {
             'market': 'KRW-' + symbol,
@@ -1142,10 +1198,11 @@ class SellOrder:
         def api_call():
             response = requests.post(SERVER_URL + "/v1/orders", params=query, headers=headers)
             return response.json()
-        
+
         response_dict = safe_api_call(api_call)
         if 'uuid' in response_dict:
-            sell_uuids.append(response_dict['uuid'])
+            self.uuid = response_dict['uuid']
+            sell_uuids.append(self.uuid)
             print_log(LogLevel.INFO, f"Sell order placed at {price:,.0f} KRW, volume: {volume:.6f}")
         else:
             print_log(LogLevel.ERROR, f"Failed to place sell order: {response_dict}")
@@ -1326,6 +1383,11 @@ class SellController:
         self.last_sell_placement_time = None
         self.last_stop_loss_check = None
         self.stop_loss_check_interval = 30
+        # 그리드 매매용 per-order 매도 추적
+        self.sell_orders_tracking = []  # [{uuid, price, volume, tier, filled}]
+        self.filled_sell_count = 0      # 체결된 매도 개수
+        self.sell_round = 0             # 매도 주문 라운드 누적 (분할 개수 결정용)
+        self.last_sell_base_price = None  # 직전 매도 기준가 (갱신 감지용)
 
     def has_holdings(self, symbol):
         """보유 코인이 있는지 확인"""
@@ -1356,32 +1418,92 @@ class SellController:
         print_log(LogLevel.INFO, f"Cancelling all sell orders for {symbol}")
         OrderCanceler().cancel_sell_orders()
 
-    def place_sell_orders(self, symbol, profit_percentages):
-        """매도 주문 걸기"""
+    def place_sell_orders(self, symbol, profit_percentages, dynamic_buyer=None):
+        """매도 주문 걸기 — 매수 최저가 기준 (평단가 아님).
+        dynamic_buyer.executed_orders 에서 매수 최저가를 추출.
+        locked(이미 매도 주문에 잠긴 수량)은 포함하지 않아 insufficient_funds_ask 방지."""
         try:
-            avg_buy_price = self.get_avg_buy_price(symbol)
-            total_volume = self.get_total_volume(symbol)
-            
-            if total_volume < MIN_HOLDING_VOLUME or avg_buy_price <= 0:
-                print_log(LogLevel.WARNING, f"매도 불가 - 부족한 수량: {total_volume:.6f}")
+            available_volume = self.get_available_volume(symbol)
+
+            if available_volume < MIN_HOLDING_VOLUME:
+                print_log(LogLevel.WARNING, f"매도 불가 - 부족한 수량: {available_volume:.6f}")
                 return False
 
-            print_log(LogLevel.INFO, f"매도주문 - 평단: {avg_buy_price:,.0f}, 전체수량: {total_volume:.6f}")
+            # 매도 기준가 결정 — 매수 최저가 우선, 폴백으로 평단가 사용
+            sell_base_price = None
+            if dynamic_buyer and dynamic_buyer.executed_orders:
+                executed_prices = [o['executed_price'] for o in dynamic_buyer.executed_orders
+                                   if o.get('executed_price', 0) > 0]
+                if executed_prices:
+                    sell_base_price = min(executed_prices)  # 매수 최저가
+                    print_log(LogLevel.INFO,
+                              f"매도 기준가 = 매수 최저가 {sell_base_price:,.4f} "
+                              f"(체결 매수 {len(executed_prices)}건)")
+            if sell_base_price is None or sell_base_price <= 0:
+                sell_base_price = self.get_avg_buy_price(symbol)
+                print_log(LogLevel.INFO, f"매도 기준가 = 평단가 {sell_base_price:,.0f} (폴백)")
 
-            sell_volume_per_order = total_volume / len(profit_percentages)
-            
-            for i, profit_pct in enumerate(profit_percentages):
-                sell_price = UpbitTickSystem.calculate_sell_price(avg_buy_price, profit_pct)
-                
-                print_log(LogLevel.INFO, 
+            print_log(LogLevel.INFO, f"매도주문 - 기준가: {sell_base_price:,.4f}, 매도가능수량: {available_volume:.6f}")
+
+            # 단계적 분할 개수 결정 — 매도 라운드 누적 기준
+            # 1~4라운드: 단일, 5~8: 이중, 9~: 삼중
+            self.sell_round += 1
+            if self.sell_round <= 4:
+                max_splits = 1
+            elif self.sell_round <= 8:
+                max_splits = 2
+            else:
+                max_splits = 3
+            split_percentages = profit_percentages[:max_splits]
+            print_log(LogLevel.INFO,
+                      f"매도 라운드 {self.sell_round} → {len(split_percentages)}중 분할매도")
+
+            # 최소주문금액 검사 — 분할 시 각 매도가 5000원 미만이면 분할 개수 축소
+            effective_percentages = split_percentages
+            while len(effective_percentages) > 1:
+                per_amount = (available_volume / len(effective_percentages)) * sell_base_price
+                if per_amount >= MIN_ORDER_AMOUNT:
+                    break
+                print_log(LogLevel.INFO,
+                          f"매도 분할 축소 — 건당 금액 {per_amount:,.0f}원 < {MIN_ORDER_AMOUNT}원, "
+                          f"{len(effective_percentages)}중 → {len(effective_percentages)-1}중")
+                effective_percentages = effective_percentages[:-1]
+
+            sell_volume_per_order = available_volume / len(effective_percentages)
+
+            # 기준가 저장 (갱신 감지용)
+            self.last_sell_base_price = sell_base_price
+
+            # 매도가 계산 — 최저가 기준 목표% 적용, 호가 중복 시 최소호가단위로 강제 분리
+            sell_prices = []
+            for profit_pct in effective_percentages:
+                sell_prices.append(UpbitTickSystem.calculate_sell_price(sell_base_price, profit_pct))
+            for i in range(1, len(sell_prices)):
+                if sell_prices[i] <= sell_prices[i - 1]:
+                    tick = UpbitTickSystem.get_minimum_tick(sell_prices[i - 1])
+                    sell_prices[i] = sell_prices[i - 1] + tick
+
+            for i, profit_pct in enumerate(effective_percentages):
+                sell_price = sell_prices[i]
+
+                print_log(LogLevel.INFO,
                          f"매도 #{i+1} - 목표: {profit_pct}%, "
                          f"가격: {sell_price:,.0f} KRW, 수량: {sell_volume_per_order:.6f}")
-                
-                SellOrder(symbol, sell_volume_per_order, sell_price)
+
+                sell_order = SellOrder(symbol, sell_volume_per_order, sell_price)
+                # per-order 추적 — UUID/가격/수량/tier 저장 (체결 시 되사들이기용)
+                if sell_order and sell_order.uuid:
+                    self.sell_orders_tracking.append({
+                        'uuid': sell_order.uuid,
+                        'price': sell_price,
+                        'volume': sell_volume_per_order,
+                        'tier': i + 1,
+                        'filled': False
+                    })
 
             self.last_sell_placement_time = datetime.now()
             return True
-            
+
         except Exception as e:
             print_log(LogLevel.ERROR, f"매도주문 실패: {str(e)}")
             traceback.print_exc()
@@ -1467,11 +1589,119 @@ class SellController:
             print_log(LogLevel.ERROR, f"Emergency sell order error: {str(e)}")
             return False
 
-    def manage_sell_orders(self, symbol, profit_percentages, trading_manager, wait_count):
-        """매도 주문 관리 - 스탑로스 기능 추가"""
-        
+    def check_sell_fills(self, symbol, dynamic_buyer):
+        """매도 per-order 체결 확인 — 체결된 매도는 되받은 KRW만큼
+        다음 매수 지점(미체결 다음 레벨)에 추가 투자.
+        추적 중인 매도 전체가 체결되면 True(사이클 완료) 반환."""
+        if not self.sell_orders_tracking:
+            return False
+
+        all_filled = True
+        for entry in self.sell_orders_tracking:
+            if entry['filled']:
+                continue
+            try:
+                # 매도 주문 상태 직접 조회 (GET /v1/order)
+                params = {'uuid': entry['uuid']}
+                query_string = unquote(urlencode(params, doseq=True)).encode("utf-8")
+                m = hashlib.sha512()
+                m.update(query_string)
+                query_hash = m.hexdigest()
+                payload = {
+                    'access_key': ACCESS_KEY,
+                    'nonce': str(uuid.uuid4()),
+                    'query_hash': query_hash,
+                    'query_hash_alg': 'SHA512',
+                }
+                jwt_token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+                headers = {"Authorization": f'Bearer {jwt_token}', "Accept": "application/json"}
+
+                def api_call():
+                    response = requests.get(SERVER_URL + "/v1/order", params=params, headers=headers)
+                    return response.json()
+                order_info = safe_api_call(api_call)
+
+                if order_info and order_info.get('state') == 'done':
+                    entry['filled'] = True
+                    self.filled_sell_count += 1
+                    executed_vol = float(order_info.get('executed_volume', entry['volume']))
+                    sell_price = entry['price']
+                    rebuy_krw = executed_vol * sell_price  # 매도로 되받은 KRW
+
+                    # 다음 매수 지점(미체결 다음 레벨)에 추가 투자
+                    self._reinvest_to_next_buy(dynamic_buyer, rebuy_krw, entry['tier'])
+                else:
+                    all_filled = False
+            except Exception as e:
+                print_log(LogLevel.ERROR, f"매도 체결 확인 중 오류 (tier {entry['tier']}): {str(e)}")
+                all_filled = False
+
+        return all_filled
+
+    def _reinvest_to_next_buy(self, dynamic_buyer, krw_amount, sell_tier):
+        """매도로 되받은 KRW를 잠재 매수 주문의 예산에 비례 가산.
+        즉시 주문을 실행하지 않고 예산(quantity)만 늘려둠 — 나중에 해당 레벨이
+        차례가 되어 _execute_single_order 가 호출될 때 가산된 예산이 반영됨.
+        잠재 매수가 0개면, 마지막 체결 지점에 즉시 재매수(예산 가산 불가)."""
+        if not dynamic_buyer or krw_amount < MIN_ORDER_AMOUNT:
+            if krw_amount < MIN_ORDER_AMOUNT:
+                print_log(LogLevel.INFO,
+                          f"매도#{sell_tier} 체결 → 재투자액 {krw_amount:,.0f}원 < {MIN_ORDER_AMOUNT}원, 스킵")
+            return
+
+        # 잠재 매수 주문: 아직 실행된 적도 없고 pending도 아닌 주문
+        pending_levels = set()
+        for p in dynamic_buyer.pending_orders:
+            pending_levels.add(p['level'])
+
+        potential = [o for o in sorted(dynamic_buyer.active_planned_orders, key=lambda x: x['level'])
+                     if not o['executed'] and o['level'] not in pending_levels]
+
+        if potential:
+            # 잠재 매수 예산에 균등 가산 (즉시 주문 실행 없음)
+            share = krw_amount / len(potential)
+            levels_str = ', '.join(f"L{o['level']}({o['planned_price']:.2f})" for o in potential)
+            print_log(LogLevel.INFO,
+                      f"매도#{sell_tier} 체결 → {krw_amount:,.0f}원을 "
+                      f"잠재 매수 {len(potential)}건 예산에 가산 (건당 +{share:,.0f}원): [{levels_str}]")
+            for order in potential:
+                order['quantity'] += share
+                order['volume'] = order['quantity'] / order['planned_price']
+                print_log(LogLevel.INFO,
+                          f"📌 level {order['level']} ({order['planned_price']:.4f}) 예산 "
+                          f"{order['quantity']-share:,.0f} → {order['quantity']:,.0f}원 (나중에 실행 시 반영)")
+        else:
+            # 잠재 매수가 0개 — 마지막 체결 지점에 즉시 재매수 (가산할 잠재 주문이 없으므로)
+            if not dynamic_buyer.executed_orders:
+                print_log(LogLevel.WARNING, f"매도#{sell_tier} 체결 → 잠재/체결 매수 모두 없음, 스킵")
+                return
+            last_executed = max(dynamic_buyer.executed_orders, key=lambda o: o['level'])
+            last_price = last_executed['executed_price']
+            volume = krw_amount / last_price if last_price > 0 else 0
+            if volume > 0:
+                dynamic_buyer.place_dynamic_buy_order(last_price, volume)
+                print_log(LogLevel.SUCCESS,
+                          f"💰 매도#{sell_tier} 체결 → 잠재 매수 없음, "
+                          f"마지막 체결 지점 level {last_executed['level']} ({last_price:.4f})에 "
+                          f"{krw_amount:,.0f}원 재매수")
+
+    def manage_sell_orders(self, symbol, profit_percentages, trading_manager, wait_count, dynamic_buyer=None):
+        """매도 주문 관리 - per-order 체결 추적 + 되사들이기 + 스탑로스"""
+
         if self.check_stop_loss(symbol, trading_manager):
             return True
+
+        # 매도 per-order 체결 추적 — 체결 시 매수 되사들이기, 전체 체결 시 완료
+        if self.sell_orders_tracking:
+            if self.check_sell_fills(symbol, dynamic_buyer):
+                # 3건 모두 체결 → 사이클 완전 종료
+                trading_manager.mark_sell_orders_executed()
+                print_log(LogLevel.SUCCESS,
+                          f"🎉 매도 {self.filled_sell_count}건 모두 체결 — 사이클 완전 종료")
+                self.sell_orders_tracking = []
+                self.filled_sell_count = 0
+                sell_uuids.clear()
+                return True
 
         if not self.has_holdings(symbol):
             if trading_manager.sell_orders_placed:
@@ -1480,23 +1710,40 @@ class SellController:
             return True
 
         if not self.has_pending_sell_orders(symbol):
-            total_volume = self.get_total_volume(symbol)
-            if total_volume >= MIN_HOLDING_VOLUME:
-                print_log(LogLevel.INFO, f"매도주문 없음 - 새 매도주문 걸기 (전체수량: {total_volume:.6f})")
-                if self.place_sell_orders(symbol, profit_percentages):
+            available_volume = self.get_available_volume(symbol)
+            if available_volume >= MIN_HOLDING_VOLUME:
+                print_log(LogLevel.INFO, f"매도주문 없음 - 새 매도주문 걸기 (매도가능수량: {available_volume:.6f})")
+                if self.place_sell_orders(symbol, profit_percentages, dynamic_buyer):
                     trading_manager.mark_sell_orders_placed()
             else:
-                print_log(LogLevel.WARNING, f"매도주문 걸기 실패 - 부족한 수량: {total_volume:.6f}")
+                print_log(LogLevel.WARNING, f"매도주문 걸기 실패 - 부족한 수량: {available_volume:.6f}")
             return False
 
-        available_volume = self.get_available_volume(symbol)
-        total_volume = self.get_total_volume(symbol)
-            
-        if available_volume >= MIN_HOLDING_VOLUME:
-            print_log(LogLevel.INFO, f"미체결 매도물량 발견 - 취소 후 재계산 (전체: {total_volume:.6f}, 미체결: {available_volume:.6f})")
+        # 매도 주문이 걸려있는 상태 — 매수 평균가(최저가) 변경 감지
+        # 평단가/최저가가 바뀌었으면 기존 매도 취소 후 새 기준가로 재설정
+        current_base = None
+        if dynamic_buyer and dynamic_buyer.executed_orders:
+            executed_prices = [o['executed_price'] for o in dynamic_buyer.executed_orders
+                               if o.get('executed_price', 0) > 0]
+            if executed_prices:
+                current_base = min(executed_prices)
+        if current_base is None or current_base <= 0:
+            current_base = self.get_avg_buy_price(symbol)
+
+        if self.last_sell_base_price is not None and abs(current_base - self.last_sell_base_price) > 0.000001:
+            print_log(LogLevel.INFO,
+                      f"📉 매도 기준가 변경 감지: {self.last_sell_base_price:,.4f} → {current_base:,.4f} "
+                      f"— 기존 매도 취소 후 재설정")
+            # 기존 매도 추적/UUID 초기화
+            self.sell_orders_tracking = []
+            self.filled_sell_count = 0
             self.cancel_all_sell_orders(symbol)
-            if self.place_sell_orders(symbol, profit_percentages):
-                print_log(LogLevel.SUCCESS, "매도주문 전체 재계산 완료")
+            # 새 기준가로 매도 재설정
+            available_volume = self.get_available_volume(symbol)
+            if available_volume >= MIN_HOLDING_VOLUME:
+                if self.place_sell_orders(symbol, profit_percentages, dynamic_buyer):
+                    print_log(LogLevel.SUCCESS, "매도주문 갱신 완료 (새 기준가)")
+
         return False
 
 class CandleInfoFetcher:
@@ -1535,7 +1782,7 @@ class VolatilityProtector:
     """동적 매수 보호 클래스 - 고변동성 코인 매수 방지"""
     
     @staticmethod
-    def check_volatility_protection(symbol, lookback_period=60, threshold_percentage=60.0):
+    def check_volatility_protection(symbol, lookback_period=60, threshold_percentage=40.0):
         """
         변동성 보호 체크
         최근 lookback_period 캔들 동안 최소값과 최대값 차이가 threshold_percentage 이상이면 매수 금지
@@ -1917,7 +2164,7 @@ if __name__=="__main__":
         drop_percentage = args.drop_percentage if args.drop_percentage else 1 / 3
         distribution_type = args.distribution_type if args.distribution_type else DynamicBuyOrder.DistributionType.LOG_LINEAR_II
         distribution_weight = args.weight if args.weight else 1 / 30
-        profit_percentage = args.profit_percentage if args.profit_percentage else 0.32
+        profit_percentage = args.profit_percentage if args.profit_percentage else 0.16
 
         InitialBalance = S = AccountChecker().get_krw_balance()
         print_log(LogLevel.INFO, f"Available KRW: {int(S):,}")
@@ -1928,9 +2175,9 @@ if __name__=="__main__":
                 print_log(LogLevel.ERROR, "Minimum starting balance is 1,000,000 won")
                 exit()
             else:
-                S = int(args.starting_balance * COMMISSION)
+                S = int(args.starting_balance)
         else:
-            S = int(S * COMMISSION)
+            S = int(S)  # 수수료 사전 공제 제거 — 잔액 전액 투자 (수수료는 체결 시 업비트가 부과)
 
         cycle_count = 0
         while True:
@@ -1980,31 +2227,14 @@ if __name__=="__main__":
                         time.sleep(30)
                         continue
                 else:
-                    if args.auto_select:
-                        selected_symbol = SymbolSelector.select_best_symbol()
-                        if selected_symbol is None:
-                            print_log(LogLevel.WARNING, "No valid symbol found, waiting 30 seconds before retry...")
-                            time.sleep(30)
-                            continue
-                        symbol = selected_symbol
-                    else:
-                        symbol = "BTC"
-                        if VolatilityProtector.check_volatility_protection(symbol):
-                            print_log(LogLevel.WARNING, f"Default symbol {symbol} blocked by volatility protection - using alternative")
-                            # 대안 심볼 찾기
-                            alternative_symbols = ["ETH", "XRP", "ADA"]
-                            symbol_found = False
-                            for alt_symbol in alternative_symbols:
-                                if not VolatilityProtector.check_volatility_protection(alt_symbol):
-                                    symbol = alt_symbol
-                                    symbol_found = True
-                                    print_log(LogLevel.INFO, f"Using alternative symbol: {symbol}")
-                                    break
-                            
-                            if not symbol_found:
-                                print_log(LogLevel.WARNING, "All alternative symbols blocked by volatility protection - waiting...")
-                                time.sleep(30)
-                                continue
+                    # 자동 선별 — 심볼 발견될 때까지 무한 대기 (대안 폴백 없음)
+                    selected_symbol = SymbolSelector.select_best_symbol()
+                    if selected_symbol is None:
+                        print_log(LogLevel.WARNING,
+                                 "No valid symbol found — waiting 30s, will retry until a symbol is available")
+                        time.sleep(30)
+                        continue
+                    symbol = selected_symbol
 
                 analyzer = MarketAnalyzer(symbol)
                 trading_manager.set_symbol(symbol)
@@ -2021,14 +2251,17 @@ if __name__=="__main__":
                     analyzer = MarketAnalyzer(symbol)
                     
                 analyzer = MarketAnalyzer(symbol)
-                drop_count = 18
+                drop_count = 10
 
-                print_log(LogLevel.INFO, 
+                # 새 매수 전 선제 스윕: 잔존 매수(bid) 주문 확실히 정리
+                # (사이클 타임아웃/재시작 등으로 거래소에 남은 주문이 새 매수와 겹치는 것 방지)
+                OrderCanceler().cancel_buy_orders()
+
+                print_log(LogLevel.INFO,
                          f"Market Analysis - RSI: {analyzer.get_rsi():.2f}, "
                          f"Volatility: {analyzer.volatility_ratio:.4f}, "
                          f"Drop Levels: {drop_count}")
 
-                distribution_type = DynamicBuyOrder.DistributionType.LOG_LINEAR_I
                 dynamic_buyer = DynamicBuyOrder(symbol, analyzer.candle.current_price, analyzer.candle.low_prices[-1], S, distribution_weight, 0)
                 dynamic_buyer.calculate_order_plan(drop_percentage, drop_count, distribution_type)
 
@@ -2040,7 +2273,8 @@ if __name__=="__main__":
                     # 병렬 관리: 매수 진행 중에도 매도 관리 시작
                     print_log(LogLevel.SUCCESS, "=== STARTING PARALLEL BUY/SELL MANAGEMENT ===")
                     sell_controller = SellController()
-                    profit_targets = [profit_percentage]
+                    # 삼중 분할매도 — 0.15% / 0.18% / 0.21%, 각각 보유량의 1/3씩
+                    profit_targets = [0.15, 0.18, 0.21]
                     
                     cycle_start_time = datetime.now()
                     cycle_timeout = 86400  
@@ -2054,6 +2288,8 @@ if __name__=="__main__":
                         # 타임아웃 체크
                         if (current_time - cycle_start_time).total_seconds() > cycle_timeout:
                             print_log(LogLevel.WARNING, f"Trading cycle timeout after {cycle_timeout} seconds")
+                            # 타임아웃 종료 시 잔존 매수 확실히 취소 (다음 사이클로 넘어가기 전)
+                            OrderCanceler().cancel_buy_orders()
                             trading_completed = True
                             break
                         
@@ -2071,6 +2307,8 @@ if __name__=="__main__":
                             # 첫 번째 주문이 타임아웃되면 거래 중단
                             if len(dynamic_buyer.executed_orders) == 0:
                                 print_log(LogLevel.WARNING, "First order timeout - stopping trading cycle")
+                                # 잔존 매수 확실히 취소 후 종료
+                                OrderCanceler().cancel_buy_orders()
                                 trading_completed = True
                                 break
                         
@@ -2086,7 +2324,7 @@ if __name__=="__main__":
                             
                             # 매도 주문 관리
                             is_trading_complete = sell_controller.manage_sell_orders(
-                                symbol, profit_targets, trading_manager, 0
+                                symbol, profit_targets, trading_manager, 0, dynamic_buyer
                             )
                             
                             if is_trading_complete:
@@ -2126,7 +2364,7 @@ if __name__=="__main__":
                     SymbolSelector.mark_symbol_as_traded(symbol)
                 
                 OrderCanceler().cancel_buy_orders()
-                
+
                 if trading_manager.stop_loss_triggered:
                     print_log(LogLevel.WARNING, "Trading completed due to stop loss")
                     exit(0)
@@ -2138,9 +2376,9 @@ if __name__=="__main__":
             profit_loss = int(S - InitialBalance)
             print_log(LogLevel.INFO,
                      f"Cycle {cycle_count} Result - Profit/Loss: {profit_loss:+,} KRW ({datetime.now() - START_TIME})")
-            
+
             log_balance(S)
-            S = int(S * COMMISSION)
+            S = int(S)  # 수수료 사전 공제 제거 — 벌은 돈 포함 잔액 전액 재투자
             
             trading_manager.reset()
             print_log(LogLevel.INFO, f"Cycle {cycle_count} completed. Waiting for next cycle...")
