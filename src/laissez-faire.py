@@ -215,6 +215,9 @@ class UpbitWebSocket:
         self.thread = None
         self.price_cache = {}        # {symbol: latest_price}
         self.cache_timestamp = {}    # {symbol: timestamp}
+        # 현재 진행중인 1분 캔들 저가 캐시 (슬라이딩 기준가 산출용)
+        self.candle_low_cache = {}        # {symbol: candle low_price}
+        self.candle_low_timestamp = {}    # {symbol: timestamp}
         self.current_symbol = None
         self.is_connected = False
         self._should_reconnect = True
@@ -246,6 +249,16 @@ class UpbitWebSocket:
             return None  # 만료 — REST 폴백
         return self.price_cache[symbol]
 
+    def get_candle_low(self, symbol):
+        """캐시에서 현재 진행중인 1분 캔들의 저가 조회.
+        캐시 만료/미수신 시 None 반환(호출자가 REST 폴백)."""
+        if symbol not in self.candle_low_cache:
+            return None
+        ts = self.candle_low_timestamp.get(symbol, 0)
+        if (datetime.now().timestamp() - ts) > self.CACHE_TTL:
+            return None  # 만료 — REST 폴백
+        return self.candle_low_cache[symbol]
+
     def _connect_loop(self):
         """백그라운드 스레드 — 재연결 루프."""
         backoff = 1
@@ -269,22 +282,33 @@ class UpbitWebSocket:
     def _on_open(self, ws):
         self.is_connected = True
         code = f"KRW-{self.current_symbol}"
+        # 단일 연결에서 ticker(현재가) + candle.1m(현재 진행중 캔들 저가) 동시 구독
         req = [{"ticket": f"laissez-faire-{int(time.time())}"},
-               {"type": "ticker", "codes": [code]}]
+               {"type": "ticker", "codes": [code]},
+               {"type": "candle.1m", "codes": [code]}]
         ws.send(json.dumps(req))
-        print_log(LogLevel.SUCCESS, f"WebSocket 연결 성공 — {code} ticker 수신 대기")
+        print_log(LogLevel.SUCCESS, f"WebSocket 연결 성공 — {code} ticker/candle.1m 수신 대기")
 
     def _on_message(self, ws, message):
-        """ticker 메시지 파싱 → 캐시 갱신."""
+        """ticker / candle.1m 메시지 파싱 → 캐시 갱신."""
         try:
             data = json.loads(message.decode('utf-8')) if isinstance(message, (bytes, bytearray)) else json.loads(message)
+            msg_type = data.get('type', '')
             code = data.get('code', '')
-            if code.startswith('KRW-'):
-                symbol = code[4:]
+            if not code.startswith('KRW-'):
+                return
+            symbol = code[4:]
+            if msg_type == 'ticker':
                 price = data.get('trade_price')
                 if price:
                     self.price_cache[symbol] = float(price)
                     self.cache_timestamp[symbol] = datetime.now().timestamp()
+            elif msg_type == 'candle.1m':
+                # 현재 진행중인 1분 캔들의 누적 저가
+                low = data.get('low_price')
+                if low:
+                    self.candle_low_cache[symbol] = float(low)
+                    self.candle_low_timestamp[symbol] = datetime.now().timestamp()
         except Exception as e:
             pass  # 파싱 오류는 조용히 무시
 
@@ -296,6 +320,32 @@ class UpbitWebSocket:
         self.is_connected = False
         if self._should_reconnect:
             print_log(LogLevel.INFO, "WebSocket 연결 종료 — 재연결 대기")
+
+    @staticmethod
+    def fetch_candle_low_rest(symbol):
+        """REST 폴백: 현재 진행중인 1분 캔들의 저가 조회.
+        /v1/candles/minutes/{UNIT} 의 첫 번째 결과 = 가장 최근(진행중) 캔들."""
+        try:
+            def api_call():
+                url = f"{CANDLE_URL}?market=KRW-{symbol}&count=1"
+                headers = {"Accept": "application/json"}
+                response = requests.get(url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data and len(data) > 0:
+                        return float(data[0]['low_price'])
+                elif response.status_code == 429:
+                    print_log(LogLevel.WARNING, "API rate limit exceeded (candle low)")
+                    time.sleep(1)
+                    return None
+                else:
+                    print_log(LogLevel.WARNING,
+                              f"Failed to get candle low: {response.status_code}")
+                    return None
+            return safe_api_call(api_call)
+        except Exception as e:
+            print_log(LogLevel.EXCEPTION, f"Error getting candle low: {str(e)}")
+            return None
 
 
 class VolatilityScanner:
@@ -548,6 +598,17 @@ class RealMarketData:
         """웹소켓 구독 시작 (심볼 확정 시 호출)."""
         if RealMarketData._ws:
             RealMarketData._ws.subscribe(symbol)
+
+    @staticmethod
+    def get_candle_low(symbol):
+        """현재 진행중인 1분 캔들의 저가.
+        웹소켓 candle.1m 캐시 우선 → REST 폴백 → 실패 시 None."""
+        if RealMarketData._ws:
+            cached = RealMarketData._ws.get_candle_low(symbol)
+            if cached is not None:
+                return cached
+        # 폴백: REST candles/minutes
+        return UpbitWebSocket.fetch_candle_low_rest(symbol)
 
 class RateLimiter:
     def __init__(self, interval):
@@ -991,13 +1052,14 @@ class DynamicBuyOrder:
                 'shift_applied': 0.0
             })
 
-    def _calculate_required_shift(self, current_low_price):
-        """필요한 밀림량 계산 - 저가 기준"""
+    def _calculate_required_shift(self, reference_price):
+        """필요한 밀림량 계산 - (캔들 저가 + 현재가)/2 기준.
+        reference_price 는 check_and_continue 에서 (저가+현재가)/2 로 산출한 슬라이딩 기준가."""
         required_shift = 0.0
-        
+
         for order in self.active_planned_orders:
-            if not order['executed'] and order['planned_price'] > current_low_price:
-                gap = order['planned_price'] - current_low_price
+            if not order['executed'] and order['planned_price'] > reference_price:
+                gap = order['planned_price'] - reference_price
                 if gap > required_shift:
                     required_shift = gap
         
@@ -1056,11 +1118,20 @@ class DynamicBuyOrder:
         current_price = RealMarketData.get_current_price(self.symbol)
         if not current_price:
             return False
-            
+
         self.current_price = current_price
-        
-        # 계획 밀림 확인 (현재가 기준)
-        self._check_and_apply_plan_shift(current_price)
+
+        # 슬라이딩 기준가 = (현재 진행중 캔들 저가 + 현재가) / 2
+        # 현재가로 직접 슬라이딩하지 않고 캔들 중간가를 기준으로 적용
+        candle_low = RealMarketData.get_candle_low(self.symbol)
+        if candle_low is not None and candle_low > 0:
+            sliding_ref = (candle_low + current_price) / 2.0
+        else:
+            # 저가 미수신 시 안전 폴백: 현재가 기준 (기존 동작)
+            sliding_ref = current_price
+
+        # 계획 밀림 확인 ((저가+현재가)/2 기준)
+        self._check_and_apply_plan_shift(sliding_ref)
         
         # 첫 주문 타임아웃 체크
         if (self.first_order_start_time and 
@@ -1083,9 +1154,10 @@ class DynamicBuyOrder:
         
         return False
 
-    def _check_and_apply_plan_shift(self, current_price):
-        """계획 밀림 확인 및 적용 - 현재가 기준"""
-        required_shift = self._calculate_required_shift(current_price)
+    def _check_and_apply_plan_shift(self, reference_price):
+        """계획 밀림 확인 및 적용 - (캔들 저가+현재가)/2 기준.
+        reference_price 는 check_and_continue 에서 산출한 슬라이딩 기준가."""
+        required_shift = self._calculate_required_shift(reference_price)
         
         if required_shift > 0:
             # ✅ 체결되지 않은 대기 주문만 취소
@@ -1746,6 +1818,49 @@ class SellController:
         print_log(LogLevel.INFO, f"Cancelling all sell orders for {symbol}")
         OrderCanceler().cancel_sell_orders()
 
+    def _compute_sell_plan(self, sell_base_price, available_volume, profit_percentages):
+        """매도 분할 개수/호가/수량만 계산 (주문 X).
+        현재 sell_round 값을 기준으로 분할 개수 결정 (sell_round 증가는 호출자 책임).
+        반환: (pairs, vol_per)
+          pairs   = [(profit_pct, price), ...]
+          vol_per = 티어당 주문 수량"""
+        # 단계적 분할 개수 결정 — 매도 라운드 누적 기준
+        # 1~4라운드: 단일, 5~8: 이중, 9~: 삼중
+        if self.sell_round <= 4:
+            max_splits = 1
+        elif self.sell_round <= 8:
+            max_splits = 2
+        else:
+            max_splits = 3
+        split_percentages = profit_percentages[:max_splits]
+        print_log(LogLevel.INFO,
+                  f"매도 라운드 {self.sell_round} → {len(split_percentages)}중 분할매도")
+
+        # 최소주문금액 검사 — 분할 시 각 매도가 5000원 미만이면 분할 개수 축소
+        effective_percentages = split_percentages
+        while len(effective_percentages) > 1:
+            per_amount = (available_volume / len(effective_percentages)) * sell_base_price
+            if per_amount >= MIN_ORDER_AMOUNT:
+                break
+            print_log(LogLevel.INFO,
+                      f"매도 분할 축소 — 건당 금액 {per_amount:,.0f}원 < {MIN_ORDER_AMOUNT}원, "
+                      f"{len(effective_percentages)}중 → {len(effective_percentages)-1}중")
+            effective_percentages = effective_percentages[:-1]
+
+        vol_per = available_volume / len(effective_percentages)
+
+        # 매도가 계산 — 기준가 대비 목표% 적용, 호가 중복 시 최소호가단위로 강제 분리
+        prices = []
+        for profit_pct in effective_percentages:
+            prices.append(UpbitTickSystem.calculate_sell_price(sell_base_price, profit_pct))
+        for i in range(1, len(prices)):
+            if prices[i] <= prices[i - 1]:
+                tick = UpbitTickSystem.get_minimum_tick(prices[i - 1])
+                prices[i] = prices[i - 1] + tick
+
+        pairs = list(zip(effective_percentages, prices))
+        return pairs, vol_per
+
     def place_sell_orders(self, symbol, profit_percentages, dynamic_buyer=None):
         """매도 주문 걸기 — 매수 평단가 기준.
         매도가는 무조건 평단가보다 위여야 이득 (매수 최저가 기준은 평단가 대비 손실).
@@ -1766,46 +1881,15 @@ class SellController:
 
             print_log(LogLevel.INFO, f"매도주문 - 기준가: {sell_base_price:,.4f}, 매도가능수량: {available_volume:.6f}")
 
-            # 단계적 분할 개수 결정 — 매도 라운드 누적 기준
-            # 1~4라운드: 단일, 5~8: 이중, 9~: 삼중
+            # 분할 라운드 증가 — 헬퍼는 현재 sell_round 기준으로 분할 개수 결정
             self.sell_round += 1
-            if self.sell_round <= 4:
-                max_splits = 1
-            elif self.sell_round <= 8:
-                max_splits = 2
-            else:
-                max_splits = 3
-            split_percentages = profit_percentages[:max_splits]
-            print_log(LogLevel.INFO,
-                      f"매도 라운드 {self.sell_round} → {len(split_percentages)}중 분할매도")
-
-            # 최소주문금액 검사 — 분할 시 각 매도가 5000원 미만이면 분할 개수 축소
-            effective_percentages = split_percentages
-            while len(effective_percentages) > 1:
-                per_amount = (available_volume / len(effective_percentages)) * sell_base_price
-                if per_amount >= MIN_ORDER_AMOUNT:
-                    break
-                print_log(LogLevel.INFO,
-                          f"매도 분할 축소 — 건당 금액 {per_amount:,.0f}원 < {MIN_ORDER_AMOUNT}원, "
-                          f"{len(effective_percentages)}중 → {len(effective_percentages)-1}중")
-                effective_percentages = effective_percentages[:-1]
-
-            sell_volume_per_order = available_volume / len(effective_percentages)
+            pairs, sell_volume_per_order = self._compute_sell_plan(
+                sell_base_price, available_volume, profit_percentages)
 
             # 기준가 저장 (갱신 감지용)
             self.last_sell_base_price = sell_base_price
 
-            # 매도가 계산 — 최저가 기준 목표% 적용, 호가 중복 시 최소호가단위로 강제 분리
-            sell_prices = []
-            for profit_pct in effective_percentages:
-                sell_prices.append(UpbitTickSystem.calculate_sell_price(sell_base_price, profit_pct))
-            for i in range(1, len(sell_prices)):
-                if sell_prices[i] <= sell_prices[i - 1]:
-                    tick = UpbitTickSystem.get_minimum_tick(sell_prices[i - 1])
-                    sell_prices[i] = sell_prices[i - 1] + tick
-
-            for i, profit_pct in enumerate(effective_percentages):
-                sell_price = sell_prices[i]
+            for i, (profit_pct, sell_price) in enumerate(pairs):
 
                 print_log(LogLevel.INFO,
                          f"매도 #{i+1} - 목표: {profit_pct}%, "
@@ -1827,6 +1911,103 @@ class SellController:
 
         except Exception as e:
             print_log(LogLevel.ERROR, f"매도주문 실패: {str(e)}")
+            traceback.print_exc()
+            return False
+
+    def _reconcile_sell_orders(self, symbol, new_avg, profit_percentages, dynamic_buyer=None):
+        """평단가 갱신 시 기존 locked(미체결 매도)를 티어별 호가 기준으로 부분 유지.
+        - 새 티어 호가 == 기존 locked 호가 → locked 유지, 부족분만 같은 호가에 추가 주문
+        - 새 티어 수량 < 유지된 locked 수량 → locked 그대로, 남은 balance는 이월(부분 취소 불가)
+        - 새 매도에 매칭되지 않은 기존 locked → 취소
+        - 매칭 없는 새 티어 → 신규 주문
+        수량은 판정에 사용하지 않고 호가만 비교한다."""
+        try:
+            available_volume = self.get_available_volume(symbol)
+            if available_volume < MIN_HOLDING_VOLUME:
+                print_log(LogLevel.WARNING,
+                          f"매도 재조정 불가 - 부족한 수량: {available_volume:.6f}")
+                return False
+
+            # sell_round 증가 없이 현재 라운드 기준 분할 계산
+            pairs, vol_per = self._compute_sell_plan(
+                new_avg, available_volume, profit_percentages)
+
+            # 기존 미체결 tracking을 호가(price)로 인덱싱
+            existing = {}
+            for e in self.sell_orders_tracking:
+                if not e['filled']:
+                    existing.setdefault(e['price'], []).append(e)
+
+            used_existing = set()   # id(entry) 기준 — 새 티어가 가져간 locked
+
+            for i, (profit_pct, price) in enumerate(pairs):
+                target_vol = vol_per
+                matched_entries = existing.get(price, [])
+                if matched_entries:
+                    # 같은 호가의 locked 전부 유지 — 첫 번째만 쓰지 않고 전부 matched 표시
+                    for me in matched_entries:
+                        used_existing.add(id(me))
+                    kept_vol = sum(me['volume'] for me in matched_entries)
+
+                    if target_vol > kept_vol:
+                        # 부족분만 같은 호가에 추가 주문
+                        diff = target_vol - kept_vol
+                        if diff >= MIN_HOLDING_VOLUME:
+                            print_log(LogLevel.INFO,
+                                      f"매도 #{i+1} 호가 {price:,.0f} 일치 → "
+                                      f"locked {len(matched_entries)}건({kept_vol:.6f}) 유지 + "
+                                      f"부족분({diff:.6f}) 추가 주문")
+                            so = SellOrder(symbol, diff, price)
+                            if so and so.uuid:
+                                self.sell_orders_tracking.append({
+                                    'uuid': so.uuid, 'price': price,
+                                    'volume': diff, 'tier': matched_entries[0]['tier'],
+                                    'filled': False
+                                })
+                        else:
+                            print_log(LogLevel.INFO,
+                                      f"매도 #{i+1} 호가 {price:,.0f} 일치 → "
+                                      f"locked {len(matched_entries)}건({kept_vol:.6f}) 유지 "
+                                      f"(부족분 미미, 추가 X)")
+                    else:
+                        # locked 수량이 새 티어 수량 이상 → 그대로 유지, balance 이월
+                        print_log(LogLevel.INFO,
+                                  f"매도 #{i+1} 호가 {price:,.0f} 일치 → "
+                                  f"locked {len(matched_entries)}건({kept_vol:.6f}) 유지 "
+                                  f"(target {target_vol:.6f}, 이월)")
+                else:
+                    # 매칭 없는 새 티어 → 신규 주문
+                    print_log(LogLevel.INFO,
+                              f"매도 #{i+1} 호가 {price:,.0f} 신규 주문 "
+                              f"(목표 {profit_pct}%, 수량 {target_vol:.6f})")
+                    so = SellOrder(symbol, target_vol, price)
+                    if so and so.uuid:
+                        self.sell_orders_tracking.append({
+                            'uuid': so.uuid, 'price': price,
+                            'volume': target_vol, 'tier': i + 1,
+                            'filled': False
+                        })
+
+            # 새 매도에 매칭되지 않은 기존 locked는 취소
+            for price, entries in existing.items():
+                for e in entries:
+                    if id(e) not in used_existing:
+                        print_log(LogLevel.INFO,
+                                  f"기존 매도 호가 {price:,.0f} 미매칭 → 취소 "
+                                  f"(uuid {e['uuid']})")
+                        OrderCanceler().cancel_order(e['uuid'])
+                        if e['uuid'] in sell_uuids:
+                            sell_uuids.remove(e['uuid'])
+                        if e in self.sell_orders_tracking:
+                            self.sell_orders_tracking.remove(e)
+
+            # 기준가 갱신 — 다음 루프에서 재진입 방지
+            self.last_sell_base_price = new_avg
+            self.last_sell_placement_time = datetime.now()
+            return True
+
+        except Exception as e:
+            print_log(LogLevel.ERROR, f"매도 재조정 실패: {str(e)}")
             traceback.print_exc()
             return False
 
@@ -2049,24 +2230,18 @@ class SellController:
             return True
 
         # 평단가 변경 감지 — 매도 주문 유무와 상관없이 먼저 체크.
-        # 새 매수 체결로 평단가가 변했으면 기존 매도 취소 후 새 평단가로 갱신.
-        # 핵심: place_sell_orders 가 last_sell_base_price 를 새 평단가로 업데이트하므로
+        # 새 매수 체결로 평단가가 변했으면 매도를 새 평단가로 재조정.
+        # 단, 새 매도 호가가 기존 locked 호가와 일치하면 그 locked는 취소하지 않고 유지
+        # (호가만 비교, 수량은 무시). 부족분만 같은 호가에 추가 주문.
+        # 핵심: _reconcile_sell_orders 가 last_sell_base_price 를 새 평단가로 업데이트하므로
         # 갱신 직후 같은 평단가면 다시 갱신하지 않음 — 무한 루프 방지.
         current_avg = self.get_avg_buy_price(symbol)
         if current_avg > 0 and self.last_sell_base_price is not None:
             if abs(current_avg - self.last_sell_base_price) > 0.000001:
                 print_log(LogLevel.INFO,
                           f"📉 평단가 변경 감지: {self.last_sell_base_price:,.4f} → {current_avg:,.4f} "
-                          f"— 매도 갱신 (사이클 유지)")
-                # 기존 매도 추적/UUID 초기화
-                self.sell_orders_tracking = []
-                self.filled_sell_count = 0
-                self.cancel_all_sell_orders(symbol)
-                # 새 평단가로 매도 재설정
-                available_volume = self.get_available_volume(symbol)
-                if available_volume >= MIN_HOLDING_VOLUME:
-                    if self.place_sell_orders(symbol, profit_percentages, dynamic_buyer):
-                        print_log(LogLevel.SUCCESS, "매도주문 갱신 완료 (새 평단가)")
+                          f"— 매도 티어별 재조정 (동일 호가 locked 유지)")
+                self._reconcile_sell_orders(symbol, current_avg, profit_percentages, dynamic_buyer)
                 return False
 
         if not self.has_pending_sell_orders(symbol):

@@ -1,1 +1,1 @@
-SYMBOL XEC
+SYMBOL xec
