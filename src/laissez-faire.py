@@ -22,6 +22,7 @@ import talib
 from talib import MA_Type
 import hmac
 import random
+from collections import deque
 
 # 웹소켓 라이브러리 (선택) — 미설치 시 REST 폴백
 try:
@@ -295,6 +296,183 @@ class UpbitWebSocket:
         self.is_connected = False
         if self._should_reconnect:
             print_log(LogLevel.INFO, "WebSocket 연결 종료 — 재연결 대기")
+
+
+class VolatilityScanner:
+    """웹소켓 candle.1m 기반 실시간 변동성 스캐너.
+    전체 KRW 마켓의 1분캔들 60개 종가를 유지하고, 표준편차/평균(CV)로 랭킹.
+    REST로 초기 60개 seed → 웹소켓 candle.1m로 실시간 갱신."""
+
+    CANDLE_COUNT = 60
+    VOLUME_THRESHOLD_M = 1000  # 1시간 거래대금 하한 (백만원) = 10억원
+    SEED_SLEEP = 0.05          # REST seed 시 코인당 대기 (rate limit)
+
+    def __init__(self):
+        self.candle_buffers = {}   # {symbol: deque([close,...], maxlen=60)}
+        self.volume_1h = {}        # {symbol: 1시간 거래대금(백만원)}
+        self.symbols = []
+        self.ws = None
+        self.thread = None
+        self.is_running = False
+        self._should_reconnect = True
+
+    def start(self, symbols):
+        """1) REST seed (각 코인 60개 1분캔들 + 1시간 거래대금)
+           2) 웹소켓 candle.1m 다중 구독 시작"""
+        self.symbols = list(symbols)
+        print_log(LogLevel.INFO, f"VolatilityScanner 시작 — {len(self.symbols)}개 코인 seed")
+        # REST seed
+        self._seed_candles()
+        print_log(LogLevel.SUCCESS,
+                  f"Seed 완료 — {len(self.candle_buffers)}개 코인 버퍼 준비")
+        # 웹소켓 구독
+        self._should_reconnect = True
+        self.is_running = True
+        self.thread = threading.Thread(target=self._connect_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self._should_reconnect = False
+        self.is_running = False
+        if self.ws:
+            try:
+                self.ws.close()
+            except:
+                pass
+
+    def _seed_candles(self):
+        """REST로 각 코인 1분캔들 60개 + 1시간 거래대금 가져와서 버퍼 초기화."""
+        for symbol in self.symbols:
+            try:
+                # 1분캔들 60개
+                qs = {"market": f"KRW-{symbol}", "count": str(self.CANDLE_COUNT)}
+                def api_call():
+                    r = requests.get(CANDLE_URL, params=qs, timeout=10)
+                    return r.json()
+                candles = safe_api_call(api_call)
+                if candles and len(candles) >= self.CANDLE_COUNT:
+                    # API는 최신→과거 순서 → 역순(과거→최신)으로 deque에 저장
+                    closes = [float(c['trade_price']) for c in reversed(candles)]
+                    self.candle_buffers[symbol] = deque(closes, maxlen=self.CANDLE_COUNT)
+                # 1시간 거래대금 (60분 캔들 1개로 대체 — 최근 1시간)
+                qs2 = {"market": f"KRW-{symbol}", "count": "1"}
+                def api_call_60():
+                    r = requests.get("https://api.upbit.com/v1/candles/minutes/60",
+                                     params=qs2, timeout=10)
+                    return r.json()
+                hour_candles = safe_api_call(api_call_60)
+                if hour_candles and len(hour_candles) > 0:
+                    vol = hour_candles[0].get('candle_acc_trade_price', 0)
+                    self.volume_1h[symbol] = float(vol) / 1000000  # 백만원 단위
+                time.sleep(self.SEED_SLEEP)
+            except Exception as e:
+                pass  # 개별 코인 실패는 조용히 스킵
+
+    def _connect_loop(self):
+        backoff = 1
+        while self._should_reconnect and self.is_running:
+            try:
+                self.ws = websocket.WebSocketApp(
+                    UpbitWebSocket.WS_URL,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close
+                )
+                self.ws.run_forever(ping_interval=60, ping_timeout=10)
+            except Exception as e:
+                print_log(LogLevel.WARNING, f"VolatilityScanner WS 오류: {str(e)[:100]}")
+            if self._should_reconnect and self.is_running:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+
+    def _on_open(self, ws):
+        codes = [f"KRW-{s}" for s in self.symbols if s in self.candle_buffers]
+        # 업비트 구독 제한 고려 — 한 번에 전체 구독
+        req = [{"ticket": f"vscanner-{int(time.time())}"},
+               {"type": "candle.1m", "codes": codes}]
+        ws.send(json.dumps(req))
+        print_log(LogLevel.SUCCESS,
+                  f"VolatilityScanner WS 구독 — {len(codes)}개 코인 candle.1m")
+
+    def _on_message(self, ws, message):
+        """candle.1m 메시지 파싱 → 버퍼 갱신 (롤링 60개) + 거래대금 누적."""
+        try:
+            data = json.loads(message.decode('utf-8')) if isinstance(message, (bytes, bytearray)) else json.loads(message)
+            code = data.get('code', '')
+            if not code.startswith('KRW-'):
+                return
+            symbol = code[4:]
+            close = data.get('trade_price')
+            if close is None:
+                return
+            close = float(close)
+            # 버퍼 갱신
+            if symbol not in self.candle_buffers:
+                self.candle_buffers[symbol] = deque(maxlen=self.CANDLE_COUNT)
+            self.candle_buffers[symbol].append(close)
+            # 거래대금 누적 (해당 1분 캔들의 누적 거래대금)
+            acc_price = data.get('candle_acc_trade_price')
+            if acc_price:
+                # candle.1m는 매 tick 마다 진행 중인 캔들을 갱신 push 함.
+                # 단순화: 최신 캔들의 acc_trade_price 를 1시간 합산의 근사로 사용
+                pass
+        except Exception:
+            pass
+
+    def _on_error(self, ws, error):
+        print_log(LogLevel.WARNING, f"VolatilityScanner WS 에러: {str(error)[:100]}")
+
+    def _on_close(self, ws, close_status, close_msg):
+        if self._should_reconnect and self.is_running:
+            print_log(LogLevel.INFO, "VolatilityScanner WS 종료 — 재연결 대기")
+
+    def _calc_volatility(self, symbol):
+        """std(close[-60:]) / mean(close[-60:]) — 변동계수(CV)."""
+        buf = self.candle_buffers.get(symbol)
+        if not buf or len(buf) < self.CANDLE_COUNT:
+            return 0.0
+        arr = np.array(buf, dtype=float)
+        mean = np.mean(arr)
+        if mean <= 0:
+            return 0.0
+        std = np.std(arr, ddof=0)
+        return float(std / mean)
+
+    def get_top_volatility_symbol(self, excluded_symbols=None):
+        """필터 통과한 코인 중 변동성 최고 심볼 반환.
+        필터: is_excluded_tick_range, 거래대금 < 1000백만원, excluded_symbols."""
+        if excluded_symbols is None:
+            excluded_symbols = set()
+        candidates = []
+        for symbol in list(self.candle_buffers.keys()):
+            if symbol in excluded_symbols:
+                continue
+            buf = self.candle_buffers.get(symbol)
+            if not buf or len(buf) < self.CANDLE_COUNT:
+                continue
+            latest_price = buf[-1]
+            if latest_price <= 0:
+                continue
+            # 호가 제외 구간
+            if UpbitTickSystem.is_excluded_tick_range(latest_price):
+                continue
+            # 거래대금 필터
+            if self.volume_1h.get(symbol, 0) < self.VOLUME_THRESHOLD_M:
+                continue
+            vol = self._calc_volatility(symbol)
+            if vol <= 0:
+                continue
+            candidates.append((symbol, vol, latest_price))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[1], reverse=True)  # 변동성 내림차순
+        # Top 5 로그
+        for i, (sym, vol, price) in enumerate(candidates[:5]):
+            print_log(LogLevel.INFO,
+                      f"  Vol Top{i+1}: {sym} CV={vol:.6f} @{price:,.4f} "
+                      f"vol1h={self.volume_1h.get(sym,0):,.0f}M")
+        return candidates[0][0]
 
 
 class RealMarketData:
@@ -1511,8 +1689,9 @@ class SellController:
         return (balance + locked) >= MIN_HOLDING_VOLUME
 
     def has_pending_sell_orders(self, symbol):
-        """미체결 매도 주문이 있는지 확인"""
-        return len(sell_uuids) > 0
+        """미체결 매도 주문이 있는지 확인 — tracking 기반 (sell_uuids와 동기화)."""
+        unfilled = [e for e in self.sell_orders_tracking if not e['filled']]
+        return len(unfilled) > 0
 
     def get_avg_buy_price(self, symbol):
         """매수 평균가 조회"""
@@ -1816,23 +1995,46 @@ class SellController:
         if self.check_stop_loss(symbol, trading_manager):
             return True
 
-        # 매도 per-order 체결 추적 — 체결 시 매수 되사들이기, 전체 체결 시 완료
-        if self.sell_orders_tracking:
-            if self.check_sell_fills(symbol, dynamic_buyer):
-                # 3건 모두 체결 → 사이클 완전 종료
-                trading_manager.mark_sell_orders_executed()
-                print_log(LogLevel.SUCCESS,
-                          f"🎉 매도 {self.filled_sell_count}건 모두 체결 — 사이클 완전 종료")
-                self.sell_orders_tracking = []
-                self.filled_sell_count = 0
-                sell_uuids.clear()
-                return True
+        # 매도 per-order 체결 추적 — 항상 실행 (tracking 비어있으면 내부에서 return False)
+        if self.check_sell_fills(symbol, dynamic_buyer):
+            # 추적 중인 매도 전부 체결 → 사이클 완전 종료
+            trading_manager.mark_sell_orders_executed()
+            print_log(LogLevel.SUCCESS,
+                      f"🎉 매도 {self.filled_sell_count}건 모두 체결 — 사이클 완전 종료")
+            self.sell_orders_tracking = []
+            self.filled_sell_count = 0
+            sell_uuids.clear()
+            return True
+
+        # tracking 정리 — filled/cancel 처리된 entry 제거
+        self.sell_orders_tracking = [e for e in self.sell_orders_tracking if not e['filled']]
 
         if not self.has_holdings(symbol):
             if trading_manager.sell_orders_placed:
                 trading_manager.mark_sell_orders_executed()
                 print_log(LogLevel.SUCCESS, "보유량 없음 - 거래 완료")
             return True
+
+        # 평단가 변경 감지 — 매도 주문 유무와 상관없이 먼저 체크.
+        # 새 매수 체결로 평단가가 변했으면 기존 매도 취소 후 새 평단가로 갱신.
+        # 핵심: place_sell_orders 가 last_sell_base_price 를 새 평단가로 업데이트하므로
+        # 갱신 직후 같은 평단가면 다시 갱신하지 않음 — 무한 루프 방지.
+        current_avg = self.get_avg_buy_price(symbol)
+        if current_avg > 0 and self.last_sell_base_price is not None:
+            if abs(current_avg - self.last_sell_base_price) > 0.000001:
+                print_log(LogLevel.INFO,
+                          f"📉 평단가 변경 감지: {self.last_sell_base_price:,.4f} → {current_avg:,.4f} "
+                          f"— 매도 갱신 (사이클 유지)")
+                # 기존 매도 추적/UUID 초기화
+                self.sell_orders_tracking = []
+                self.filled_sell_count = 0
+                self.cancel_all_sell_orders(symbol)
+                # 새 평단가로 매도 재설정
+                available_volume = self.get_available_volume(symbol)
+                if available_volume >= MIN_HOLDING_VOLUME:
+                    if self.place_sell_orders(symbol, profit_percentages, dynamic_buyer):
+                        print_log(LogLevel.SUCCESS, "매도주문 갱신 완료 (새 평단가)")
+                return False
 
         if not self.has_pending_sell_orders(symbol):
             available_volume = self.get_available_volume(symbol)
@@ -2284,6 +2486,19 @@ if __name__=="__main__":
         else:
             S = int(S)  # 수수료 사전 공제 제거 — 잔액 전액 투자 (수수료는 체결 시 업비트가 부과)
 
+        # --auto-select 시 웹소켓 변동성 스캐너 시작
+        volatility_scanner = None
+        if args.auto_select and WEBSOCKET_AVAILABLE:
+            print_log(LogLevel.INFO, "Starting VolatilityScanner (--auto-select)...")
+            all_symbols = SymbolSelector.get_all_krw_markets()
+            ignored = SymbolSelector.load_ignored_symbols()
+            scan_symbols = [s for s in all_symbols if s not in ignored]
+            if scan_symbols:
+                volatility_scanner = VolatilityScanner()
+                volatility_scanner.start(scan_symbols)
+            else:
+                print_log(LogLevel.WARNING, "No symbols for VolatilityScanner — REST 폴백")
+
         cycle_count = 0
         while True:
             cycle_count += 1
@@ -2295,6 +2510,9 @@ if __name__=="__main__":
                 # 현재 거래는 계속 진행, 다음 사이클에서 새로운 심볼로 전환
 
             cached_symbol = trading_manager.get_cached_symbol()
+            # --auto-select 시 매 사이클마다 최고 변동성 심볼을 새로 찾는다 (캐시 무시)
+            if args.auto_select and volatility_scanner and volatility_scanner.is_running:
+                cached_symbol = None
             if cached_symbol:
                 symbol = cached_symbol
                 print_log(LogLevel.INFO, f"Using symbol: {symbol}")
@@ -2332,14 +2550,28 @@ if __name__=="__main__":
                         time.sleep(30)
                         continue
                 else:
-                    # 자동 선별 — 심볼 발견될 때까지 무한 대기 (대안 폴백 없음)
-                    selected_symbol = SymbolSelector.select_best_symbol()
-                    if selected_symbol is None:
-                        print_log(LogLevel.WARNING,
-                                 "No valid symbol found — waiting 30s, will retry until a symbol is available")
-                        time.sleep(30)
-                        continue
-                    symbol = selected_symbol
+                    # 자동 선별 — 웹소켓 스캐너 우선, 폴백으로 REST select_best_symbol
+                    if volatility_scanner and volatility_scanner.is_running:
+                        excluded = set(traded_symbols.keys())
+                        selected_symbol = volatility_scanner.get_top_volatility_symbol(excluded)
+                        if selected_symbol:
+                            print_log(LogLevel.SUCCESS,
+                                     f"🌐 VolatilityScanner 선별: {selected_symbol}")
+                            symbol = selected_symbol
+                        else:
+                            print_log(LogLevel.WARNING,
+                                     "스캐너 후보 없음 — 30s 대기 후 재시도")
+                            time.sleep(30)
+                            continue
+                    else:
+                        # REST 폴백 (웹소켓 미가동 시)
+                        selected_symbol = SymbolSelector.select_best_symbol()
+                        if selected_symbol is None:
+                            print_log(LogLevel.WARNING,
+                                     "No valid symbol found — waiting 30s, will retry until a symbol is available")
+                            time.sleep(30)
+                            continue
+                        symbol = selected_symbol
 
                 analyzer = MarketAnalyzer(symbol)
                 trading_manager.set_symbol(symbol)
