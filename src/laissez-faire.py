@@ -300,15 +300,15 @@ class UpbitWebSocket:
 
 class VolatilityScanner:
     """웹소켓 candle.1m 기반 실시간 변동성 스캐너.
-    전체 KRW 마켓의 1분캔들 60개 종가를 유지하고, 표준편차/평균(CV)로 랭킹.
-    REST로 초기 60개 seed → 웹소켓 candle.1m로 실시간 갱신."""
+    전체 KRW 마켓의 1분캔들 20개 종가를 유지하고, 표준편차/평균(CV)로 랭킹.
+    REST로 초기 20개 seed → 웹소켓 candle.1m로 실시간 갱신."""
 
-    CANDLE_COUNT = 60
-    VOLUME_THRESHOLD_M = 1000  # 1시간 거래대금 하한 (백만원) = 10억원
+    CANDLE_COUNT = 20
+    VOLUME_THRESHOLD_M = 5000  # 24시간 거래대금 하한 (백만원) = 50억원
     SEED_SLEEP = 0.05          # REST seed 시 코인당 대기 (rate limit)
 
     def __init__(self):
-        self.candle_buffers = {}   # {symbol: deque([close,...], maxlen=60)}
+        self.candle_buffers = {}   # {symbol: deque([close,...], maxlen=20)}
         self.volume_1h = {}        # {symbol: 1시간 거래대금(백만원)}
         self.symbols = []
         self.ws = None
@@ -317,7 +317,7 @@ class VolatilityScanner:
         self._should_reconnect = True
 
     def start(self, symbols):
-        """1) REST seed (각 코인 60개 1분캔들 + 1시간 거래대금)
+        """1) REST seed (각 코인 1분캔들 20개 + ticker 24h 거래대금)
            2) 웹소켓 candle.1m 다중 구독 시작"""
         self.symbols = list(symbols)
         print_log(LogLevel.INFO, f"VolatilityScanner 시작 — {len(self.symbols)}개 코인 seed")
@@ -340,33 +340,66 @@ class VolatilityScanner:
             except:
                 pass
 
+    def _seed_one(self, symbol):
+        """코인 1개 seed — 1분캔들 20개만 조회. (병렬 워커용)
+        거래대금은 _seed_candles에서 ticker 1회 호출로 전 코인 처리.
+        반환: (symbol, closes_or_None)"""
+        try:
+            qs = {"market": f"KRW-{symbol}", "count": str(self.CANDLE_COUNT)}
+            def api_call():
+                r = requests.get(CANDLE_URL, params=qs, timeout=10)
+                return r.json()
+            candles = safe_api_call(api_call)
+            if candles and len(candles) >= self.CANDLE_COUNT:
+                # API는 최신→과거 순서 → 역순(과거→최신)
+                return (symbol, [float(c['trade_price']) for c in reversed(candles)])
+            return (symbol, None)
+        except Exception:
+            return (symbol, None)
+
     def _seed_candles(self):
-        """REST로 각 코인 1분캔들 60개 + 1시간 거래대금 가져와서 버퍼 초기화."""
-        for symbol in self.symbols:
-            try:
-                # 1분캔들 60개
-                qs = {"market": f"KRW-{symbol}", "count": str(self.CANDLE_COUNT)}
-                def api_call():
-                    r = requests.get(CANDLE_URL, params=qs, timeout=10)
-                    return r.json()
-                candles = safe_api_call(api_call)
-                if candles and len(candles) >= self.CANDLE_COUNT:
-                    # API는 최신→과거 순서 → 역순(과거→최신)으로 deque에 저장
-                    closes = [float(c['trade_price']) for c in reversed(candles)]
-                    self.candle_buffers[symbol] = deque(closes, maxlen=self.CANDLE_COUNT)
-                # 1시간 거래대금 (60분 캔들 1개로 대체 — 최근 1시간)
-                qs2 = {"market": f"KRW-{symbol}", "count": "1"}
-                def api_call_60():
-                    r = requests.get("https://api.upbit.com/v1/candles/minutes/60",
-                                     params=qs2, timeout=10)
-                    return r.json()
-                hour_candles = safe_api_call(api_call_60)
-                if hour_candles and len(hour_candles) > 0:
-                    vol = hour_candles[0].get('candle_acc_trade_price', 0)
-                    self.volume_1h[symbol] = float(vol) / 1000000  # 백만원 단위
-                time.sleep(self.SEED_SLEEP)
-            except Exception as e:
-                pass  # 개별 코인 실패는 조용히 스킵
+        """REST로 1분캔들 20개(코인별 병렬) + 24h 거래대금(ticker 1회) 수집 → 버퍼 초기화."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # 1) 거래대금 — ticker 다중 조회 1회로 전 코인 수집 (캔들 API는 다중 불가이나 ticker는 가능)
+        try:
+            markets_param = ",".join(f"KRW-{s}" for s in self.symbols)
+            def ticker_call():
+                r = requests.get(TICKER_URL, params={"markets": markets_param}, timeout=15)
+                return r.json()
+            tickers = safe_api_call(ticker_call)
+            if tickers:
+                for t in tickers:
+                    code = t.get('market', '')
+                    if code.startswith('KRW-'):
+                        sym = code[4:]
+                        # acc_trade_price_24h: 원 단위 → 백만 원 단위
+                        self.volume_1h[sym] = float(t.get('acc_trade_price_24h', 0)) / 1000000
+                print_log(LogLevel.INFO,
+                          f"거래대금 seed 완료 — ticker 1회로 {len(tickers)}개 코인")
+        except Exception as e:
+            print_log(LogLevel.WARNING, f"ticker 거래대금 seed 실패: {str(e)[:100]}")
+
+        # 2) 1분캔들 20개 — 병렬 수집 (업비트 캔들 rate limit 초당 10회 준수)
+        seeded = 0
+        failed = 0
+        lock = threading.Lock()
+        pbar = tqdm(total=len(self.symbols), desc="VolatilityScanner seed", leave=False)
+        # rate limit(10/s)을 넘지 않도록 병렬도 제한 — 캔들 호출만 카운트
+        max_workers = min(8, (len(self.symbols) or 1))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(self._seed_one, s) for s in self.symbols]
+            for fut in as_completed(futures):
+                symbol, closes = fut.result()
+                with lock:
+                    if closes:
+                        self.candle_buffers[symbol] = deque(closes, maxlen=self.CANDLE_COUNT)
+                        seeded += 1
+                    else:
+                        failed += 1
+                    pbar.update(1)
+                    pbar.set_postfix(ok=seeded, fail=failed)
+        pbar.close()
 
     def _connect_loop(self):
         backoff = 1
@@ -396,7 +429,7 @@ class VolatilityScanner:
                   f"VolatilityScanner WS 구독 — {len(codes)}개 코인 candle.1m")
 
     def _on_message(self, ws, message):
-        """candle.1m 메시지 파싱 → 버퍼 갱신 (롤링 60개) + 거래대금 누적."""
+        """candle.1m 메시지 파싱 → 버퍼 갱신 (롤링 20개) + 거래대금 누적."""
         try:
             data = json.loads(message.decode('utf-8')) if isinstance(message, (bytes, bytearray)) else json.loads(message)
             code = data.get('code', '')
@@ -428,7 +461,7 @@ class VolatilityScanner:
             print_log(LogLevel.INFO, "VolatilityScanner WS 종료 — 재연결 대기")
 
     def _calc_volatility(self, symbol):
-        """std(close[-60:]) / mean(close[-60:]) — 변동계수(CV)."""
+        """std(close[-20:]) / mean(close[-20:]) — 변동계수(CV)."""
         buf = self.candle_buffers.get(symbol)
         if not buf or len(buf) < self.CANDLE_COUNT:
             return 0.0
@@ -2277,13 +2310,22 @@ class SymbolSelector:
     def get_all_krw_markets():
         try:
             def api_call():
-                url = "https://api.upbit.com/v1/market/all"
+                # details=true: market_event(주의/경고 종목) 필드 수신
+                url = "https://api.upbit.com/v1/market/all?details=true"
                 headers = {"Accept": "application/json"}
                 response = requests.get(url, headers=headers, timeout=10)
                 return response.json()
-            
+
             markets = safe_api_call(api_call)
-            krw_markets = [market for market in markets if market['market'].startswith('KRW-') and not market['market_event']['warning']]
+            if not markets:
+                return []
+            # market_event는 details=true 일부 코인에서만 내려올 수 있어 .get()으로 안전 접근.
+            # 키가 없으면 warning=False(통과)로 간주.
+            krw_markets = [
+                market for market in markets
+                if market['market'].startswith('KRW-')
+                and not market.get('market_event', {}).get('warning', False)
+            ]
             return [market['market'].replace('KRW-', '') for market in krw_markets]
         except Exception as e:
             print_log(LogLevel.ERROR, f"Failed to get KRW markets: {str(e)}")
@@ -2528,18 +2570,21 @@ if __name__=="__main__":
                 analyzer = MarketAnalyzer(symbol)
             else:
                 # command.txt에서 심볼 읽기 (기존 로직)
+                # 단, --auto-select 시 command.txt의 SYMBOL은 무시하고 항상 스캐너 사용.
+                # (EXIT 등 다른 명령은 check_command_file()에서 별도 처리되므로 영향 없음)
                 symbol_from_command = None
-                try:
-                    with open("../log/command.txt", 'r', encoding='utf-8') as f:
-                        lines = f.readlines()
-                        for line in lines:
-                            text = line.strip().upper()
-                            parts = text.split(' ')
-                            if parts[0] == 'SYMBOL' and len(parts) > 1:
-                                symbol_from_command = parts[1]
-                                break
-                except:
-                    symbol_from_command = None
+                if not args.auto_select:
+                    try:
+                        with open("../log/command.txt", 'r', encoding='utf-8') as f:
+                            lines = f.readlines()
+                            for line in lines:
+                                text = line.strip().upper()
+                                parts = text.split(' ')
+                                if parts[0] == 'SYMBOL' and len(parts) > 1:
+                                    symbol_from_command = parts[1]
+                                    break
+                    except:
+                        symbol_from_command = None
 
                 if symbol_from_command:
                     symbol = symbol_from_command
@@ -2585,7 +2630,10 @@ if __name__=="__main__":
             # 매수 프로세스 시작 전 command 변경 체크
             if trading_manager.should_place_buy_orders():
                 # command 오버라이드가 있으면 즉시 적용 (새로운 거래 시작 시에만)
-                if trading_manager.pending_symbol_change and not trading_manager.is_trading_in_progress():
+                # 단, --auto-select 시에는 command.txt 심볼을 무시 (스캐너 결과 유지)
+                if (not args.auto_select
+                        and trading_manager.pending_symbol_change
+                        and not trading_manager.is_trading_in_progress()):
                     symbol = trading_manager.apply_pending_symbol_change()
                     print_log(LogLevel.INFO, f"Applied command override symbol: {symbol}")
                     analyzer = MarketAnalyzer(symbol)
