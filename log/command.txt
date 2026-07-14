@@ -1,1 +1,1 @@
-SYMBOL xec
+SYMBOL blast
