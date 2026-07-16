@@ -2639,7 +2639,7 @@ if __name__=="__main__":
                     analyzer = MarketAnalyzer(symbol)
                     
                 analyzer = MarketAnalyzer(symbol)
-                drop_count = 10
+                drop_count = 7
 
                 # 새 매수 전 선제 스윕: 잔존 매수(bid) 주문 확실히 정리
                 # (사이클 타임아웃/재시작 등으로 거래소에 남은 주문이 새 매수와 겹치는 것 방지)
@@ -2661,8 +2661,10 @@ if __name__=="__main__":
                     # 병렬 관리: 매수 진행 중에도 매도 관리 시작
                     print_log(LogLevel.SUCCESS, "=== STARTING PARALLEL BUY/SELL MANAGEMENT ===")
                     sell_controller = SellController()
-                    # 삼중 분할매도 — 0.15% / 0.18% / 0.21%, 각각 보유량의 1/3씩
-                    profit_targets = [0.15, 0.18, 0.21]
+                    # 삼중 분할매도 — 0.16% 출발, 이후 0.04%p 간격 (0.16 / 0.20 / 0.24%)
+                    # 라운드 게이팅: 단일=[0.16], 이중=[0.16,0.20], 삼중=[0.16,0.20,0.24]
+                    # 각각 보유량의 1/N씩.
+                    profit_targets = [0.16, 0.20, 0.24]
                     
                     cycle_start_time = datetime.now()
                     cycle_timeout = 86400  

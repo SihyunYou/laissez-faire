@@ -10,3 +10,5 @@ ChatEtChien/ChatEtChien/bin/
 *.pdb
 *.suo
 *.cache
+log/balance.txt
+log/state.txt

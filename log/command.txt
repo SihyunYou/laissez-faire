@@ -1,1 +1,1 @@
-SYMBOL blast
+SYMBOL vana
