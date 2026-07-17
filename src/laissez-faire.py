@@ -1174,7 +1174,7 @@ class DynamicBuyOrder:
         self.last_order_time = None
         self.last_check_time = None
         self.first_order_start_time = None
-        self.first_order_timeout = 7
+        self.first_order_timeout = 3
         self.executed_count = 0  # 체결된 주문 수 — O(1) 완료 체크용
         
         # 계획 관리
@@ -1228,6 +1228,14 @@ class DynamicBuyOrder:
 
         # 인접 주문 가격 중복 시 호가 최소단위만큼 강제 하락 (예: 150/150 → 150/149)
         self._enforce_min_tick_gap()
+
+        # 마지막 레벨에 잔량 전액 투입 — 분배 누적 합이 total_amount와 정확히 일치하도록
+        # (부동소수점 누적 오차 + 반올림으로 발생하는 잔량 완전 제거)
+        if self.active_planned_orders:
+            allocated = sum(o['quantity'] for o in self.active_planned_orders[:-1])
+            self.active_planned_orders[-1]['quantity'] = self.total_amount - allocated
+            last = self.active_planned_orders[-1]
+            last['volume'] = last['quantity'] / last['planned_price'] if last['planned_price'] > 0 else 0
 
         self.original_planned_orders = [order.copy() for order in self.active_planned_orders]
         print_log(LogLevel.SUCCESS, f"Calculated {len(self.active_planned_orders)} buy orders for {self.symbol} based on low price {self.low_price:.4f}")
@@ -1945,7 +1953,25 @@ class TradingManager:
         self.forced_symbol_change = False
         self.pending_symbol_change = None  # 대기 중인 심볼 변경
         self.current_command_symbol = None  # command.txt에서 읽은 최신 SYMBOL (캐시)
-        
+        # command.txt 백그라운드 감시 — 파일 읽기를 별도 스레드로 분리
+        self._command_lines = []  # 백그라운드 스레드가 갱신
+        self._command_thread = None
+        self._start_command_watcher()
+
+    def _start_command_watcher(self):
+        """command.txt를 백그라운드 스레드에서 주기적 폴링 → 메모리 캐싱.
+        check_command_file는 파일 I/O 없이 캐시만 읽음 (핫 루프 지연 0)."""
+        def _watch():
+            while True:
+                try:
+                    with open("../log/command.txt", 'r', encoding='utf-8') as f:
+                        self._command_lines = f.readlines()
+                except Exception:
+                    pass
+                time.sleep(self.command_check_interval)
+        self._command_thread = threading.Thread(target=_watch, daemon=True)
+        self._command_thread.start()
+
     def set_symbol(self, symbol):
         """심볼 설정 및 캐시"""
         global current_trading_symbol, symbol_cache_time
@@ -1968,44 +1994,37 @@ class TradingManager:
         return None
         
     def check_command_file(self):
-        """command.txt 파일 변경 체크 — time.monotonic 기반 스로틀 (datetime 오버헤드 제거)."""
-        now_mono = time.monotonic()
-
-        if self.last_command_check and (now_mono - self.last_command_check) < self.command_check_interval:
+        """command.txt 변경 체크 — 백그라운드 캐시에서 읽기 (파일 I/O 0, 지연 0).
+        _command_watcher 스레드가 2초마다 파일을 읽어 _command_lines에 캐싱."""
+        lines = self._command_lines
+        if not lines:
             return False
-        self.last_command_check = now_mono
 
-        try:
-            with open("../log/command.txt", 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                for line in lines:
-                    text = line.strip().upper()
-                    parts = text.split(' ')
-                    if parts[0] == 'SYMBOL' and len(parts) > 1:
-                        new_symbol = parts[1]
-                        # 현재 command 심볼 캐싱 (메인 루프 재사용 — 파일 재읽기 방지)
-                        self.current_command_symbol = new_symbol
+        for line in lines:
+            text = line.strip().upper()
+            parts = text.split(' ')
+            if parts[0] == 'SYMBOL' and len(parts) > 1:
+                new_symbol = parts[1]
+                # 현재 command 심볼 캐싱 (메인 루프 재사용)
+                self.current_command_symbol = new_symbol
 
-                        # 현재 심볼과 다를 경우 대기 목록에 추가
-                        if new_symbol != self.current_symbol and new_symbol != self.pending_symbol_change:
-                            # 변동성 보호 체크
-                            if VolatilityProtector.check_volatility_protection(new_symbol):
-                                print_log(LogLevel.WARNING, f"Command symbol {new_symbol} blocked by volatility protection")
-                                return False
-                                
-                            print_log(LogLevel.INFO, f"Symbol change requested: {new_symbol} (will apply after current trading)")
-                            self.pending_symbol_change = new_symbol
-                            return True
-                            
-                    elif parts[0] == 'EXIT':
-                        # EXIT 시 동기식 즉시 쓰기 (exit 전 플러시 보장)
-                        AsyncLogger.write_sync("../log/state.txt", '#' + str(int(LogState.FORCED_EXIT)))
-                        print_log(LogLevel.WARNING, "Exit command detected")
-                        exit(0)
-                        
-        except Exception as e:
-            print_log(LogLevel.WARNING, f"Error reading command file: {str(e)}")
-            
+                # 현재 심볼과 다를 경우 대기 목록에 추가
+                if new_symbol != self.current_symbol and new_symbol != self.pending_symbol_change:
+                    # 변동성 보호 체크
+                    if VolatilityProtector.check_volatility_protection(new_symbol):
+                        print_log(LogLevel.WARNING, f"Command symbol {new_symbol} blocked by volatility protection")
+                        return False
+
+                    print_log(LogLevel.INFO, f"Symbol change requested: {new_symbol} (will apply after current trading)")
+                    self.pending_symbol_change = new_symbol
+                    return True
+
+            elif parts[0] == 'EXIT':
+                # EXIT 시 동기식 즉시 쓰기 (exit 전 플러시 보장)
+                AsyncLogger.write_sync("../log/state.txt", '#' + str(int(LogState.FORCED_EXIT)))
+                print_log(LogLevel.WARNING, "Exit command detected")
+                exit(0)
+
         return False
 
     def has_pending_symbol_change(self):
@@ -2146,15 +2165,24 @@ class SellController:
         run_async(OrderCanceler().cancel_sell_orders)
 
     def place_sell_orders(self, symbol, profit_percentages, dynamic_buyer=None):
-        """단일 매도 주문 걸기 — 매수 평단가 기준.
-        항상 보유량 전체를 단일 매도 주문으로 실행 (분할매도 폐지).
-        locked(이미 매도 주문에 잠긴 수량)은 포함하지 않아 insufficient_funds_ask 방지."""
+        """단일 매도 주문 걸기 — 보유량 전량 매도.
+        balance + locked 합산 전량을 매도 (잔량 0).
+        업비트 수량 정밀도(소수점 자릿수)에 맞게 truncate."""
         try:
-            available_volume = self.get_available_volume(symbol)
+            # 전량 매도 — balance + locked 합산
+            balance, locked, avg_buy_price = self._get_cached_symbol_info(symbol)
+            sell_volume = balance + locked
 
-            if available_volume < MIN_HOLDING_VOLUME:
-                print_log(LogLevel.WARNING, f"매도 불가 - 부족한 수량: {available_volume:.6f}")
+            if sell_volume < MIN_HOLDING_VOLUME:
+                print_log(LogLevel.WARNING, f"매도 불가 - 부족한 수량: {sell_volume:.6f}")
                 return False
+
+            # locked가 있으면 기존 미체결 매도 취소 후 전량 매도
+            if locked > 0:
+                print_log(LogLevel.INFO, f"기존 미체결 매도 취소 후 전량 매도 (locked: {locked:.6f})")
+                OrderCanceler().cancel_sell_orders()
+                # 취소 후 balance가 갱신될 때까지 잠시 대기
+                sell_volume = balance + locked  # 취소 전 기준으로 전량
 
             # 매도 기준가 = 매수 평단가 (업비트 /v1/accounts avg_buy_price)
             sell_base_price = self.get_avg_buy_price(symbol)
@@ -2167,21 +2195,25 @@ class SellController:
             profit_pct = profit_percentages[0] if profit_percentages else 0.0
             sell_price = UpbitTickSystem.calculate_sell_price(sell_base_price, profit_pct)
 
+            # 업비트 수량 정밀도 처리 — 코인별 소수점 자릿수 truncate
+            # 업비트는 대부분 8자리까지 지원하나 안전하게 8자리 truncate
+            sell_volume = math.floor(sell_volume * 1e8) / 1e8
+
             print_log(LogLevel.INFO,
-                     f"매도주문(단일) - 목표: {profit_pct}%, "
+                     f"매도주문(전량) - 목표: {profit_pct}%, "
                      f"기준가: {sell_base_price:,.4f}, 가격: {sell_price:,.0f} KRW, "
-                     f"수량: {available_volume:.6f}")
+                     f"수량: {sell_volume:.8f}")
 
             # 기준가 저장 (갱신 감지용)
             self.last_sell_base_price = sell_base_price
 
-            sell_order = SellOrder(symbol, available_volume, sell_price)
+            sell_order = SellOrder(symbol, sell_volume, sell_price)
             # 단일 매도 추적 — UUID/가격/수량 저장 (체결 시 되사들이기용)
             if sell_order and sell_order.uuid:
                 self.sell_orders_tracking.append({
                     'uuid': sell_order.uuid,
                     'price': sell_price,
-                    'volume': available_volume,
+                    'volume': sell_volume,
                     'tier': 1,
                     'filled': False
                 })
@@ -3224,7 +3256,8 @@ if __name__=="__main__":
                 if args.auto_select and not trading_manager.stop_loss_triggered:
                     SymbolSelector.mark_symbol_as_traded(symbol)
                 
-                OrderCanceler().cancel_buy_orders()
+                # 잔존 매수 비동기 취소 (메인 스레드 지연 방지)
+                run_async(OrderCanceler().cancel_buy_orders)
 
                 if trading_manager.stop_loss_triggered:
                     print_log(LogLevel.WARNING, "Trading completed due to stop loss — alarm sounding indefinitely")
