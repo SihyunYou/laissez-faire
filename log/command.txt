@@ -1,1 +1,1 @@
-SYMBOL vana
+SYMBOL trac
