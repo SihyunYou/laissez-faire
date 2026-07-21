@@ -1,44 +1,34 @@
-import requests
-import time
-import os
+# -*- coding: utf-8 -*-
+"""Deprecated shim — sync runs with the bot: python run.py
 
-REMOTE_URL = "https://pastebin.com/raw/iGrXJ3yP"
-LOCAL_FILE = "command.txt"
-CHECK_INTERVAL = 5  # 초 단위
+Standalone sync only:
+  python run.py --no-command-sync   # not this
+  Use: python -c "..." or run package command_sync
+"""
+from __future__ import annotations
 
-def fetch_remote_text():
-    try:
-        response = requests.get(REMOTE_URL)
-        response.raise_for_status()
-        return response.text
-    except Exception as e:
-        print("🚫 에러:", e)
-        return None
+import importlib.util
+import sys
+from pathlib import Path
 
-def load_local_text():
-    if not os.path.exists(LOCAL_FILE):
-        return ""
-    with open(LOCAL_FILE, "r", encoding="utf-8") as f:
-        return f.read()
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
 
-def save_local_text(text):
-    with open(LOCAL_FILE, "w", encoding="utf-8") as f:
-        f.write(text)
 
-def sync_loop():
-    print("📡 Pastebin 텍스트 동기화 시작 (Ctrl+C로 종료)...")
-    while True:
-        remote_text = fetch_remote_text()
-        if remote_text is None:
-            print("⚠️ 텍스트 불러오기 실패, 재시도 중...")
-        else:
-            local_text = load_local_text()
-            if remote_text != local_text:
-                print("🔄 변경 감지! 로컬 파일 갱신 중...")
-                save_local_text(remote_text)
-            else:
-                print("✅ 변경 없음.")
-        time.sleep(CHECK_INTERVAL)
+def _bootstrap():
+    if "laissez_faire" in sys.modules:
+        return
+    init_py = SRC / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "laissez_faire", init_py, submodule_search_locations=[str(SRC)])
+    mod = importlib.util.module_from_spec(spec)
+    mod.__path__ = [str(SRC)]
+    sys.modules["laissez_faire"] = mod
+    spec.loader.exec_module(mod)
+
+
+_bootstrap()
+from laissez_faire.command_sync import sync_loop_forever  # noqa: E402
 
 if __name__ == "__main__":
-    sync_loop()
+    sync_loop_forever()
