@@ -33,7 +33,7 @@ ORDERS_OPEN_URL = ""
 CANCEL_AND_NEW_URL = ""
 
 VERBOSE = False
-AUTO_SELECT = False
+AUTO_SELECT = True
 START_TIME = None
 InitialBalance = 0
 buy_uuids: set = set()

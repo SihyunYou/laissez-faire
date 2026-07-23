@@ -1,2 +1,3 @@
-Symbol LA
-Symbol tree
+Symbol era
+Symbol soph
+Symbol mira

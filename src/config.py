@@ -14,6 +14,41 @@ STOP_LOSS_PERCENTAGE = -8.0
 SPLIT_ORDER_MAX = 3
 SPLIT_STEP_PERCENT = 0.2
 
+# ── 병렬 코인 워커 ──
+# ★ 규칙 (혼동 금지):
+#   1) 심볼 = AUTO_SELECT: ticker/all 변동성 Top → HybridMA+vol 통과 N개 (command.txt 폐지)
+#   2) 게이트 = HybridMA(틱 MA60 + 1분 MA60) + 변동성보호
+#   3) 한도 = 가용 KRW(free) × WORKER_ALLOC_PCT[N] 안에서만 분할매수
+#      N = 게이트통과 동시 코인 수 ≤ PARALLEL_WORKERS
+#   4) 최초가용 대비 현재가용 < 50% → 신규매수 중단, 잔여→기존코인 집중
+AUTO_SELECT = True
+AUTO_SELECT_TOP_N = 3          # 상시 매수 코인 수
+AUTO_SELECT_CANDIDATE_POOL = 20  # 게이트 검사 전 ticker 변동성 상위 후보 수
+# TopN 제외 유예(초) — 순위 깜빡임으로 3슬롯이 2로 줄지 않게
+TOPN_EXCLUDE_GRACE_S = 60.0
+# ticker/all 1차 랭킹 갱신 주기(초) — 전종목 캔들 REST 금지
+TICKER_RANK_REFRESH_S = 15.0
+VOLUME_THRESHOLD_M = 5000      # 24h 거래대금 하한 (백만원) = 50억원
+PARALLEL_WORKERS = 3           # spawn 상한 = AUTO_SELECT_TOP_N
+# 스캐너 랭킹 로그 스로틀(초)
+VOL_RANK_TTL_S = 30.0
+# MA60+volatility 감시 주기(초)
+MA_GATE_WATCH_INTERVAL_S = 1.0
+GATE_WATCH_INTERVAL_S = MA_GATE_WATCH_INTERVAL_S
+# 하이브리드 MA: 1분봉 MA 기간 + 틱·분 괴리 가중 계수
+MINUTE_MA_PERIOD = 60
+HYBRID_MA_DIV_K = 8.0  # 괴리율(div)당 틱 가중 감소 — 정렬 시 ≈0.5/0.5
+DEEP_LADDER_LEVEL = 6
+# 최초가용KRW 대비 현재가용 < 이 비율이면 신규매수 중단 → 기존 코인 집중
+KRW_RESERVE_RATIO = 0.50
+# N개 동시 매수 시 각 워커 한도 = 가용KRW × 아래 % (÷N 없음, 합>100% OK)
+WORKER_ALLOC_PCT = {
+    1: 0.9,   # 1개 → 각 가용 90%
+    2: 0.8,   # 2개 → 각 가용 80%
+    3: 0.7,   # 3개 → 각 가용 70%
+    4: 0.6,   # 4개 → 각 가용 60%
+}
+
 EXCHANGE_CONFIGS = {
     "upbit": {
         "name": "upbit",

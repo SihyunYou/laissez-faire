@@ -292,7 +292,8 @@ def response_order_or_error(response):
 
 class OrderRateLimiter:
     """업비트 order 그룹(주문생성·cancel_and_new) 초당 한도 내부 추적.
-    공식 8/sec — 슬롯 없으면 짧게만 대기(1초 풀블로킹 금지)."""
+    공식 8/sec — 슬롯 없으면 짧게만 대기(1초 풀블로킹 금지).
+    병렬 워커: worker_id별 공정 쿼터로 한 워커가 SAFE 전체를 독점하지 않게."""
     LIMIT = 8
     SAFE = 7  # 1 여유 — 매수 삼중 POST가 매도 슬롯에 전부 막히지 않게
     WINDOW = 1.0
@@ -303,6 +304,14 @@ class OrderRateLimiter:
         self._header_remaining = None  # Remaining-Req sec (order group)
         self._header_block_until = 0.0  # sec=0 / 429 후 이 시각까지 대기
         self._usage = deque(maxlen=40)  # (mono_ts, reason) — sec=0 원인 추적
+        # worker fair-share: worker_id → deque of hit timestamps
+        self._worker_hits = {}  # type: dict[str, deque]
+        self._active_workers = 1
+
+    def set_active_workers(self, n: int):
+        """병렬 코인 워커 수 — 워커당 SAFE/n 몫 (최소 1)."""
+        with self._lock:
+            self._active_workers = max(1, int(n or 1))
 
     def note_use(self, reason):
         """order 그룹 슬롯 사용 사유 기록."""
@@ -331,21 +340,47 @@ class OrderRateLimiter:
         if self._header_block_until and now >= self._header_block_until:
             self._header_block_until = 0.0
             self._header_remaining = None
+        dead = []
+        for wid, dq in self._worker_hits.items():
+            while dq and (now - dq[0]) >= w:
+                dq.popleft()
+            if not dq:
+                dead.append(wid)
+        for wid in dead:
+            self._worker_hits.pop(wid, None)
 
-    def acquire(self, timeout=0.35, cost=1):
+    def _worker_quota(self):
+        n = max(1, int(self._active_workers))
+        # 분할매수(최대 3) 기준으로 워커당 최소 3슬롯 — 너무 쪼개면 대기만 늘어남
+        return max(3, (self.SAFE + n - 1) // n)
+
+    def acquire(self, timeout=0.35, cost=1, worker_id=None):
         """슬롯 확보. 성공 True, timeout 초과 False.
-        매수 핫패스 — 최대 ~0.35s만 대기 (예전 1.5s/sec=0 풀블로킹 제거)."""
+        worker_id 있으면 워커 쿼터 우선 적용 후 전역 SAFE 여유분 사용."""
         cost = max(1, int(cost))
         deadline = time.monotonic() + max(0.02, float(timeout))
+        wid = str(worker_id) if worker_id else None
         while True:
             with self._lock:
                 now = time.monotonic()
                 self._prune(now)
-                # header remaining=0 이어도 block_until 지난 뒤엔 로컬 윈도우만 신뢰
                 hdr_block = self._header_block_until > now
-                if (not hdr_block) and (len(self._hits) + cost <= self.SAFE):
+                global_ok = (not hdr_block) and (len(self._hits) + cost <= self.SAFE)
+                worker_ok = True
+                if wid and global_ok:
+                    dq = self._worker_hits.setdefault(wid, deque())
+                    quota = self._worker_quota()
+                    # 쿼터 초과여도 전역에 여유(SAFE - used_by_others)≥cost 면 허용
+                    mine = len(dq)
+                    if mine + cost > quota:
+                        others = len(self._hits) - mine
+                        spare = self.SAFE - others
+                        worker_ok = spare >= cost
+                if global_ok and worker_ok:
                     for _ in range(cost):
                         self._hits.append(now)
+                        if wid:
+                            self._worker_hits.setdefault(wid, deque()).append(now)
                     if self._header_remaining is not None:
                         self._header_remaining = max(
                             0, self._header_remaining - cost)
@@ -358,13 +393,15 @@ class OrderRateLimiter:
                     wait = max(0.01, min(wait, self._header_block_until - now))
             remain = deadline - time.monotonic()
             if remain <= 0:
-                # 타임아웃 — 한도는 넘기지 않되 매수 진행보다 전송 우선(SAFE+1까지)
                 with self._lock:
                     now = time.monotonic()
                     self._prune(now)
                     if len(self._hits) + cost <= self.LIMIT:
                         for _ in range(cost):
                             self._hits.append(now)
+                            if wid:
+                                self._worker_hits.setdefault(
+                                    wid, deque()).append(now)
                         return True
                 return False
             time.sleep(max(0.001, min(wait, 0.02, remain)))
@@ -402,16 +439,13 @@ class OrderRateLimiter:
                 self._prune(now)
                 self._header_remaining = sec
                 if sec <= 0:
-                    # 다음 초 경계까지만 — 풀 1.0s 블로킹 금지
                     self._header_block_until = now + 0.12
-                    # 락 밖에서 로그 (데드락 방지)
                     need_log = True
                 else:
                     self._header_block_until = 0.0
                     need_log = False
             if need_log:
                 self._log_exhaustion('Remaining-Req sec=0')
-                # hits 패딩 삭제 — 로컬 sliding window만 사용
         except Exception:
             pass
 
@@ -422,10 +456,21 @@ class OrderRateLimiter:
             self._prune(now)
             self._header_remaining = 0
             self._header_block_until = now + 0.15
-            # hits를 LIMIT까지 채우지 않음 — 매수 삼중이 1초씩 밀리지 않게
 
 
 order_rate_limiter = OrderRateLimiter()
+
+# 병렬 워커 컨텍스트 — http_post_order가 acquire(worker_id=)에 전달
+_worker_tls = threading.local()
+
+
+def set_current_worker_id(worker_id):
+    _worker_tls.worker_id = worker_id
+
+
+def get_current_worker_id():
+    return getattr(_worker_tls, 'worker_id', None)
+
 
 
 class _FakeRateLimitResponse:
@@ -437,9 +482,12 @@ class _FakeRateLimitResponse:
 
 def http_post_order(url, query, headers, reason='order_post'):
     """주문 POST — 업비트는 query params, 빗썸 v2는 JSON body.
-    order 그룹 rate limit 슬롯 확보 후 전송."""
+    order 그룹 rate limit 슬롯 확보 후 전송.
+    병렬 워커는 슬롯 대기 최대 3초(짧으면 fake-429 폭주 → 체감 지연)."""
     order_rate_limiter.note_use(reason)
-    if not order_rate_limiter.acquire(timeout=0.35):
+    wid = get_current_worker_id()
+    wait = 3.0 if wid else 0.35
+    if not order_rate_limiter.acquire(timeout=wait, worker_id=wid):
         order_rate_limiter._log_exhaustion(f'acquire-fail:{reason}')
         return _FakeRateLimitResponse()
     if EXCHANGE.get('order_post_json'):
@@ -890,10 +938,12 @@ def rest_holdings_cleared(symbol):
 # 분할 시 각 주문 금액이 MIN_ORDER_AMOUNT(5000원) 미만이면 자동으로 단일 폴백.
 SPLIT_ORDER_MAX = 3          # 전 라운드 분할 개수
 SPLIT_STEP_PERCENT = 0.2     # 분할 가격 간격 (%). 0%, -0.2%, -0.4% ...
+# ★ 워커(심볼)당 미체결 매수 절대 상한 — 절대 초과 금지
+MAX_OPEN_BUYS_PER_WORKER = SPLIT_ORDER_MAX
 
 def split_count_for_level(level):
     """전 라운드 삼중매수 — 항상 SPLIT_ORDER_MAX."""
-    return SPLIT_ORDER_MAX
+    return min(int(SPLIT_ORDER_MAX), int(MAX_OPEN_BUYS_PER_WORKER))
 
 # Global state — set 로 O(1) 멤버십/제거 (핫패스)
 InitialBalance = 0
@@ -963,6 +1013,10 @@ _QUIET_SUCCESS = (
     'Plan shifted',
     '매도',
     '재매수',
+    'sell-orphan',
+    'Command symbols',
+    'Command 신규',
+    '게이트',
     'Cycle ',
     'PnL',
 )
@@ -990,15 +1044,35 @@ _QUIET_WARNING = (
     'holding',
     'KRW budget',
     '스캐너 후보 없음',
-    'MA20 gate',
+    'MA60 gate',
+    'HybridMA',
     'Resume:',
     '잔고 조회',
     '먼지진',
+    '먼지',
+    '사다리',
+    'cycle-end',
+    '흡수대기',
     'insufficient_funds',
     '매도 대기',
     'Buy ladder resume',
+    'BUY CAP',
+    'BUY SAME-PX',
+    'fill-timeout',
+    'sell-orphan',
+    '동일호가',
     '보유0',
     '사이클 종료',
+    '사이클종료',
+    'command.txt 제외',
+    'command 제외',
+    'Command 신규',
+    '신규매수중단',
+    '집중모드',
+    '게이트 spawn',
+    '게이트 감시',
+    'AUTO',
+    'Vol Top',
 )
 
 # Quiet 모드에서도 보여줄 INFO (사이클 경계 등)
@@ -1579,11 +1653,11 @@ class TradeTickStream:
       - 업비트: CRIX 틱봉 API로 시드/갱신 (차트와 동일 소스).
         REST /v1/trades/ticks 60개 묶음은 차트 틱 정의와 불일치하므로 사용하지 않음.
       - 빗썸 등 CRIX 미지원: REST trades + WS trade 건수 집계 폴백
-      - MA20 = 최근 20개 캔들 종가의 단순평균 (진행 중 봉 포함, 차트와 동일)
+      - MA60 = 최근 60개 캔들 종가의 단순평균 (진행 중 봉 포함, 차트와 동일)
     ticker 전용 UpbitWebSocket과 동일한 패턴(백그라운드 스레드, 지수 백오프)."""
 
     TICKS_PER_CANDLE = 60   # 60틱(60체결) = 1 캔들 (업비트 60T)
-    MA_PERIOD = 20          # 20 캔들 이동평균 (= 60틱 × 20 = 1,200틱)
+    MA_PERIOD = 60          # 60 캔들 이동평균 (= 60틱 × 60 = 3,600틱)
 
     # WS_URL은 UpbitWebSocket.WS_URL을 그대로 사용 — main에서 거래소별 자동 갱신됨.
     # (두 거래소 모두 동일한 public v1 엔드포인트에서 trade 스트림 지원)
@@ -1598,8 +1672,9 @@ class TradeTickStream:
         self._pending_close = {}     # {symbol: price} — 진행 중 캔들의 최신 체결가
         # CRIX 틱봉 모드에서도 WS trade 체결가는 즉시 반영 (호가/스탑로스용)
         self._last_trade_price = {}  # {symbol: price}
+        self._last_trade_ts = {}     # {symbol: monotonic ts} — 신선도 판정
         # 구독 중인 심볼 리스트 — 다중 심볼 동시 구독 지원 (codes 배열).
-        # command.txt의 복수 심볼을 한 번에 구독하여 각각의 MA20을 독립 산출.
+        # command.txt의 복수 심볼을 한 번에 구독하여 각각의 MA60을 독립 산출.
         self.subscribed_symbols = []    # [symbol, ...]
         self.current_symbol = None      # 단일 호환 (리스트의 첫 심볼)
         self.is_connected = False
@@ -1607,43 +1682,88 @@ class TradeTickStream:
         self._connect_gen = 0
         self._last_ws_error = ''
         self._tick_candle_fetched_at = {}
-        # CRIX 백그라운드 폴링 — get_ma20 핫패스에서 REST 차단 제거
+        # CRIX 백그라운드 폴링 — get_ma60 핫패스에서 REST 차단 제거
         self._crix_bg_stop = threading.Event()
         self._crix_bg_thread = None
         self._crix_bg_interval = 1.5  # bg만 — 주문 핫패스와 무관, CPU/REST 고갈 방지
-    def subscribe(self, symbol):
-        """단일 심볼 구독 (기존 호환용 래퍼). 내부적으로 subscribe_symbols 호출."""
-        self.subscribe_symbols([symbol])
+        self._sub_lock = threading.Lock()
 
-    def subscribe_symbols(self, symbols):
-        """복수 심볼 동시 구독 시작. 기존 연결이 있으면 종료 후 새 리스트로 재연결.
-        같은 리스트(순서 무관, 집합 동일)면 재연결하지 않음 — no-op.
-        심볼이 바뀌어도 기존 종가 버퍼는 유지 (다중 심볼 폴백 시 MA20 즉시 사용 가능).
-        WS 연결 전에 REST /v1/trades/ticks 로 최근 체결을 시드하여 MA20 warmup을 단축."""
-        new_set = set(symbols)
-        cur_set = set(self.subscribed_symbols)
-        if new_set == cur_set and self.is_connected and new_set:
-            return  # 동일 심볼 집합 구독 중 — no-op
-        self.subscribed_symbols = list(symbols)
-        self.current_symbol = symbols[0] if symbols else None
-        # 주의: 버퍼(candle_closes 등)는 클리어하지 않음 — 심볼이 재구독되어도
-        # 기존 60T 종가가 유효하므로 MA20을 즉시 사용할 수 있도록 보존.
-        # 기존 루프 무효화 후 단일 스레드만 재시작 (좀비 재연결 방지).
-        self._connect_gen += 1
-        self._should_reconnect = False
-        if self.ws:
-            try:
-                self.ws.close()
-            except Exception:
-                pass
-        for sym in symbols:
-            self.seed_tick_ma(sym)
-        self._should_reconnect = True
-        if symbols:
-            gen = self._connect_gen
-            self.thread = threading.Thread(
-                target=self._connect_loop, args=(gen,), daemon=True)
-            self.thread.start()
+    def subscribe(self, symbol):
+        """단일 심볼 추가 구독 — 기존 다중 구독을 절대 덮어쓰지 않음.
+        (예전엔 subscribe_symbols([symbol])로 형제 코인 구독이 날아가
+         CALDERA에 TREE 시세가 섞이는 오염이 났음.)"""
+        if not symbol:
+            return
+        self.ensure_symbols([str(symbol).upper()])
+
+    def ensure_symbols(self, symbols):
+        """심볼을 기존 구독 집합에 합집합으로 추가. 축소(제거)는 하지 않음."""
+        if not symbols:
+            return
+        with self._sub_lock:
+            cur = list(self.subscribed_symbols)
+            merged = list(cur)
+            seen = set(cur)
+            for s in symbols:
+                if not s:
+                    continue
+                su = str(s).upper()
+                if su not in seen:
+                    seen.add(su)
+                    merged.append(su)
+            if set(merged) == set(cur) and self.is_connected and merged:
+                return
+            # 신규만 시드 — 이미 있는 심볼은 재시드/재연결 최소화
+            new_only = [s for s in merged if s not in set(cur)]
+        self.subscribe_symbols(merged, seed_symbols=new_only or None)
+
+    def subscribe_symbols(self, symbols, seed_symbols=None):
+        """복수 심볼 동시 구독. 집합이 같으면 no-op.
+        ★ 기존 구독 심볼을 제거하지 않음 (부분 리스트로 덮어쓰기 오염 방지).
+        seed_symbols: 시드할 심볼만 (None이면 신규만, 없으면 전체)."""
+        add = []
+        seen_add = set()
+        for s in (symbols or []):
+            if not s:
+                continue
+            su = str(s).upper()
+            if su not in seen_add:
+                seen_add.add(su)
+                add.append(su)
+        with self._sub_lock:
+            cur = list(self.subscribed_symbols)
+            cur_set = set(cur)
+            merged = list(cur)
+            for s in add:
+                if s not in cur_set:
+                    cur_set.add(s)
+                    merged.append(s)
+            new_only = [s for s in add if s not in set(cur)]
+            if set(merged) == set(cur) and self.is_connected and merged:
+                return  # 동일 집합 — no-op
+            self.subscribed_symbols = merged
+            self.current_symbol = merged[0] if merged else None
+            if seed_symbols is not None:
+                to_seed = [str(s).upper() for s in seed_symbols if s]
+            elif new_only:
+                to_seed = new_only
+            else:
+                to_seed = list(merged)
+            self._connect_gen += 1
+            self._should_reconnect = False
+            if self.ws:
+                try:
+                    self.ws.close()
+                except Exception:
+                    pass
+            for sym in to_seed:
+                self.seed_tick_ma(sym)
+            self._should_reconnect = True
+            if merged:
+                gen = self._connect_gen
+                self.thread = threading.Thread(
+                    target=self._connect_loop, args=(gen,), daemon=True)
+                self.thread.start()
         self._ensure_crix_bg()
 
     def _ensure_crix_bg(self):
@@ -1669,8 +1789,11 @@ class TradeTickStream:
         self._crix_bg_thread.start()
 
     def seed_tick_ma(self, symbol):
-        """60T MA20 버퍼 시드. 업비트는 차트와 동일한 CRIX 틱봉 API를 우선 사용.
+        """60T MA60 버퍼 시드. 업비트는 차트와 동일한 CRIX 틱봉 API를 우선 사용.
         실패/미지원(빗썸) 시 REST /v1/trades/ticks 폴백."""
+        if not symbol:
+            return False
+        symbol = str(symbol).upper()
         if TICK_CANDLE_URL and self.seed_from_tick_candles(symbol):
             return True
         return self.seed_from_trades(symbol)
@@ -1684,7 +1807,7 @@ class TradeTickStream:
                 return False
             self._apply_tick_candles(symbol, candles)
             closes = self.candle_closes.get(symbol) or []
-            ma_ready = self.get_ma20(symbol) is not None
+            ma_ready = self.get_ma60(symbol) is not None
             return ma_ready
         except Exception as e:
             print_log(LogLevel.WARNING,
@@ -1713,31 +1836,54 @@ class TradeTickStream:
 
     def _apply_tick_candles(self, symbol, candles):
         """CRIX 응답(최신→과거)을 candle_closes / tick_counter / pending에 반영.
-        미완성 봉(tickCount < 60)은 진행 중 캔들로 두고, 확정 봉만 종가 버퍼에 적재."""
+        미완성 봉(tickCount < 60)은 진행 중 캔들로 두고, 확정 봉만 종가 버퍼에 적재.
+        신규상장/필드누락 시 KeyError 없이 스킵."""
         if not candles:
             return
-        newest = candles[0]
+        newest = candles[0] if isinstance(candles[0], dict) else None
+        if not newest:
+            return
+
+        def _px(c):
+            if not isinstance(c, dict):
+                return None
+            v = c.get('tradePrice', c.get('trade_price'))
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
         tick_count = int(newest.get("tickCount") or newest.get("tick_count") or 60)
+        forming_px = _px(newest)
         if tick_count < self.TICKS_PER_CANDLE:
             forming = newest
             completed = candles[1:]
             self._tick_counter[symbol] = tick_count
-            self._pending_close[symbol] = float(forming["tradePrice"])
+            if forming_px and forming_px > 0:
+                self._pending_close[symbol] = forming_px
         else:
             completed = candles
             self._tick_counter[symbol] = 0
-            self._pending_close[symbol] = float(completed[0]["tradePrice"])
+            if forming_px and forming_px > 0:
+                self._pending_close[symbol] = forming_px
 
         closes = []
         for c in reversed(completed[:self.MA_PERIOD]):
-            px = c.get("tradePrice", c.get("trade_price"))
-            if px is not None:
-                closes.append(float(px))
+            px = _px(c)
+            if px is not None and px > 0:
+                closes.append(px)
+        if not closes:
+            return
         self.candle_closes[symbol] = deque(closes, maxlen=self.MA_PERIOD)
         self._tick_candle_fetched_at[symbol] = time.time()
+        # 시드 종가도 심볼별 최신가로 등록 — WS 재연결 전 오염/공란 방지
+        pending = self._pending_close.get(symbol)
+        if pending and pending > 0:
+            self._last_trade_price[symbol] = float(pending)
+            self._last_trade_ts[symbol] = time.time()
 
     def _refresh_tick_candles_if_stale(self, symbol, ttl=1.0):
-        """업비트 CRIX 틱봉을 TTL 내로 재조회해 차트 MA20과 동기화.
+        """업비트 CRIX 틱봉을 TTL 내로 재조회해 차트 MA60과 동기화.
         백그라운드 스레드에서 호출 — 게이트 핫패스 차단 금지."""
         if not TICK_CANDLE_URL:
             return
@@ -1757,7 +1903,7 @@ class TradeTickStream:
         주의: REST 체결 60개 묶음은 업비트 차트 60T와 틱 정의가 다를 수 있음."""
         if self.get_buffer_size(symbol) >= self.MA_PERIOD:
             return True
-        need = self.MA_PERIOD * self.TICKS_PER_CANDLE  # 20 × 60 = 1,200
+        need = self.MA_PERIOD * self.TICKS_PER_CANDLE  # 60 × 60 = 3,600
         try:
             trades = self._fetch_recent_trades(symbol, need)
             if not trades:
@@ -1795,8 +1941,12 @@ class TradeTickStream:
                     closes.append(chunk[-1])  # 60번째 체결가 = 캔들 종가
             closes = closes[-self.MA_PERIOD:]
             self.candle_closes[symbol] = deque(closes, maxlen=self.MA_PERIOD)
+            pending = self._pending_close.get(symbol)
+            if pending and pending > 0:
+                self._last_trade_price[symbol] = float(pending)
+                self._last_trade_ts[symbol] = time.time()
 
-            ma_ready = self.get_ma20(symbol) is not None
+            ma_ready = self.get_ma60(symbol) is not None
             return ma_ready
         except Exception as e:
             print_log(LogLevel.WARNING,
@@ -1807,7 +1957,7 @@ class TradeTickStream:
         """/v1/trades/ticks 커서 페이지네이션으로 최근 체결 need_count개 수집 (최신→과거).
         당일 체결이 부족하면 days_ago=1..7 로 이어 조회. 페이지당 최대 500."""
         collected = []
-        # None=당일, 이후 1~7일 전. 저유동성 심볼도 MA20 시드가 가능하도록.
+        # None=당일, 이후 1~7일 전. 저유동성 심볼도 MA60 시드가 가능하도록.
         for days_ago in [None] + list(range(1, 8)):
             if len(collected) >= need_count:
                 break
@@ -1870,19 +2020,21 @@ class TradeTickStream:
 
     def _on_message(self, ws, message):
         """trade 메시지 파싱 → 체결가 갱신 + (비-CRIX) 60T 캔들 집계.
-        업비트(CRIX 틱봉)는 MA20 집계는 CRIX에 맡기되, 실시간 체결가는 항상 갱신."""
+        업비트(CRIX 틱봉)는 MA60 집계는 CRIX에 맡기되, 실시간 체결가는 항상 갱신."""
         try:
             data = json_loads(message)
             code = data.get('code') or data.get('cd') or ''
             if not code.startswith('KRW-'):
                 return
-            symbol = code[4:]
+            symbol = code[4:].upper()
             price = data.get('trade_price', data.get('tp'))
             if price is None:
                 return
             price = float(price)
             # 핫패스 가격 — CRIX 여부와 무관하게 항상 최신 체결가 유지
+            # ★ code에서 파싱한 symbol만 키로 씀 (current_symbol 폴백 금지)
             self._last_trade_price[symbol] = price
+            self._last_trade_ts[symbol] = time.time()
 
             # CRIX 틱봉 사용 시 확정봉은 bg 폴링, 진행봉 종가만 실시간 반영
             if TICK_CANDLE_URL:
@@ -1909,11 +2061,14 @@ class TradeTickStream:
     def _on_close(self, ws, close_status, close_msg):
         self.is_connected = False
 
-    def get_ma20(self, symbol):
-        """MA20(최근 20개 60틱 캔들 종가의 단순이동평균) 반환.
+    def get_ma60(self, symbol):
+        """MA60(최근 60개 60틱 캔들 종가의 단순이동평균) 반환.
         업비트 차트와 동일하게 진행 중(미완성) 봉의 현재 종가도 포함한다.
-        종가 샘플이 20개 미만이면 None.
+        종가 샘플이 60개 미만이면 None.
         CRIX REST는 백그라운드 스레드만 — 여기선 메모리 읽기만 (게이트 비가동)."""
+        if not symbol:
+            return None
+        symbol = str(symbol).upper()
         closes = self.candle_closes.get(symbol)
         if not closes:
             return None
@@ -1928,18 +2083,52 @@ class TradeTickStream:
             return None
         return sum(values) / len(values)
 
-    def get_last_price(self, symbol):
-        """WS trade 실시간 체결가만. 없으면 None (ticker/REST 폴백용)."""
-        return self._last_trade_price.get(symbol)
+    # 하위 호환
+    get_ma20 = get_ma60
+    get_ma25 = get_ma60
+
+    def get_last_price(self, symbol, max_age=None):
+        """WS trade 실시간 체결가.
+        - 구독 중이 아닌 심볼의 캐시는 무시 (덮어쓰기 오염 잔재 차단)
+        - 동일 심볼 CRIX pending과 25% 이상 어긋나면 pending 우선
+        - max_age 지정 시에만 신선도 만료"""
+        if not symbol:
+            return None
+        su = str(symbol).upper()
+        # 구독 집합에 없으면 캐시 불신 (형제 워커가 단독 구독으로 덮었던 시절 잔재)
+        sub = set(self.subscribed_symbols or [])
+        if sub and su not in sub:
+            return None
+        px = self._last_trade_price.get(su)
+        if px is None:
+            return None
+        if max_age is not None and max_age > 0:
+            ts = float(self._last_trade_ts.get(su) or 0)
+            if (time.time() - ts) > max_age:
+                return None
+        # CRIX/시드 pending과 괴리 → 다른 코인 시세 오염으로 간주
+        pending = self._pending_close.get(su)
+        try:
+            pending = float(pending) if pending is not None else 0.0
+        except (TypeError, ValueError):
+            pending = 0.0
+        if pending > 0 and px > 0:
+            if abs(px - pending) / pending > 0.25:
+                return pending
+        return px
 
     def get_buffer_size(self, symbol):
-        """확정된 60틱 캔들 종가 개수 (MA20 산출엔 20개 이상 필요)."""
-        closes = self.candle_closes.get(symbol)
+        """확정된 60틱 캔들 종가 개수 (MA60 산출엔 60개 이상 필요)."""
+        if not symbol:
+            return 0
+        closes = self.candle_closes.get(str(symbol).upper())
         return len(closes) if closes else 0
 
     def get_tick_progress(self, symbol):
         """현재 진행 중인 캔들의 체결 진행도 (0~60). 디버깅/표시용."""
-        return self._tick_counter.get(symbol, 0)
+        if not symbol:
+            return 0
+        return self._tick_counter.get(str(symbol).upper(), 0)
 
 
 class UpbitPrivateWS:
@@ -1980,8 +2169,11 @@ class UpbitPrivateWS:
         self.fills_event = threading.Event()
         self.fill_event = self.fills_event  # 구버전 별칭
         self.asset_event = threading.Event()
-        # 평단→매도 핫패스: myAsset 도착 즉시 POST (대기 루프 없음)
-        self._avg_sell_lock = threading.Lock()
+        # 평단→매도 핫패스 — 심볼별 슬롯 (병렬 워커)
+        from .avg_sell_slot import AvgSellSlot
+        self._avg_sell_lock = threading.RLock()
+        self._avg_slots = {}  # symbol -> AvgSellSlot
+        # legacy flat mirror (마지막 bind 심볼) — 단일워커 호환
         self.avg_sell_symbol = None
         self.avg_sell_cb = None  # callback(avg, vol)
         self._avg_sell_armed = False
@@ -1992,23 +2184,23 @@ class UpbitPrivateWS:
         self._avg_sell_baseline_t = 0.0
         self._avg_sell_inflight = False
         self._avg_sell_fire_gen = 0
-        # 매수 체결가 하한 — REST 평단이 체결 전에 스테일로 오면 매도 호가 붕괴 방지
         self._avg_sell_price_floor = 0.0
-        # 로컬 VWAP — 사이클 시작 스냅샷 + 체결 누적 (업비트 평단과 동일 식)
-        # new = (avg0*qty0 + Σ px*vol) / (qty0 + Σ vol)
         self._local_avg_qty0 = 0.0
         self._local_avg_avg0 = 0.0
         self._local_avg_fill_vol = 0.0
         self._local_avg_fill_cost = 0.0
-        self._local_avg_uid_vol = {}   # uuid → counted executed_volume
-        self._local_avg_uid_cost = {}  # uuid → counted cost (avg*vol)
+        self._local_avg_uid_vol = {}
+        self._local_avg_uid_cost = {}
         self._avg_sell_last_fired_avg = 0.0
+        self._avg_sell_last_fired_vol = 0.0
+        self._avg_sell_last_fire_t = 0.0
         self._avg_sell_fire_is_local = False
-        self._avg_sell_awaiting_rest = False  # 로컬 fire 후 REST 교정 대기
-        self._local_avg_rest_synced = False  # REST 스냅샷 반영됨 — rebuild 이중집계 금지
+        self._avg_sell_awaiting_rest = False
+        self._local_avg_rest_synced = False
         self._avg_rest_correct_gen = 0
-        self._local_avg_max_fill = 0.0  # 사이클 내 최고 매수 체결가
-        self._pending_avg_correct = None  # inflight 중 교정 예약 (sleep 없이)
+        self._local_avg_max_fill = 0.0
+        self._pending_avg_correct = None
+        self._AvgSellSlot = AvgSellSlot
 
     def start(self, access_key, secret_key):
         """Private WS 연결 시작. 부팅 시 REST로 잔고 seed 후 WS 구독."""
@@ -2130,6 +2322,75 @@ class UpbitPrivateWS:
             ),
         }
         return currency, avg_in_msg
+
+    def _ensure_avg_slot(self, symbol):
+        """심볼별 AvgSellSlot — 없으면 생성."""
+        if not symbol:
+            return None
+        slot = self._avg_slots.get(symbol)
+        if slot is None:
+            slot = self._AvgSellSlot(symbol=symbol)
+            self._avg_slots[symbol] = slot
+        return slot
+
+    def _mirror_slot_to_flat(self, slot):
+        """단일워커 호환 — flat 필드를 슬롯과 동기화."""
+        if not slot:
+            return
+        self.avg_sell_symbol = slot.symbol
+        self.avg_sell_cb = slot.cb
+        self._avg_sell_armed = slot.armed
+        self._avg_sell_vol_hint = slot.vol_hint
+        self._avg_sell_prev_avg = slot.prev_avg
+        self._avg_sell_prev_t = slot.prev_t
+        self._avg_sell_baseline_avg = slot.baseline_avg
+        self._avg_sell_baseline_t = slot.baseline_t
+        self._avg_sell_inflight = slot.inflight
+        self._avg_sell_fire_gen = slot.fire_gen
+        self._avg_sell_price_floor = slot.price_floor
+        self._avg_sell_last_fired_avg = slot.last_fired_avg
+        self._avg_sell_fire_is_local = slot.fire_is_local
+        self._avg_sell_awaiting_rest = slot.awaiting_rest
+        self._avg_rest_correct_gen = slot.rest_correct_gen
+        self._pending_avg_correct = slot.pending_avg_correct
+        self._local_avg_qty0 = slot.local_qty0
+        self._local_avg_avg0 = slot.local_avg0
+        self._local_avg_fill_vol = slot.local_fill_vol
+        self._local_avg_fill_cost = slot.local_fill_cost
+        self._local_avg_uid_vol = slot.local_uid_vol
+        self._local_avg_uid_cost = slot.local_uid_cost
+        self._local_avg_rest_synced = slot.local_rest_synced
+        self._local_avg_max_fill = slot.local_max_fill
+
+    def _mirror_flat_to_slot(self, slot):
+        if not slot:
+            return
+        slot.cb = self.avg_sell_cb
+        slot.armed = self._avg_sell_armed
+        slot.vol_hint = self._avg_sell_vol_hint
+        slot.prev_avg = self._avg_sell_prev_avg
+        slot.prev_t = self._avg_sell_prev_t
+        slot.baseline_avg = self._avg_sell_baseline_avg
+        slot.baseline_t = self._avg_sell_baseline_t
+        slot.inflight = self._avg_sell_inflight
+        slot.fire_gen = self._avg_sell_fire_gen
+        slot.price_floor = self._avg_sell_price_floor
+        slot.last_fired_avg = self._avg_sell_last_fired_avg
+        slot.fire_is_local = self._avg_sell_fire_is_local
+        slot.awaiting_rest = self._avg_sell_awaiting_rest
+        slot.rest_correct_gen = self._avg_rest_correct_gen
+        slot.pending_avg_correct = self._pending_avg_correct
+        slot.local_qty0 = self._local_avg_qty0
+        slot.local_avg0 = self._local_avg_avg0
+        slot.local_fill_vol = self._local_avg_fill_vol
+        slot.local_fill_cost = self._local_avg_fill_cost
+        slot.local_uid_vol = self._local_avg_uid_vol
+        slot.local_uid_cost = self._local_avg_uid_cost
+        slot.local_rest_synced = self._local_avg_rest_synced
+        slot.local_max_fill = self._local_avg_max_fill
+
+    def _active_avg_symbols(self):
+        return [s for s, sl in self._avg_slots.items() if sl and sl.cb]
 
     def _clamp_sell_avg(self, avg):
         """경제 평단 — 입력 그대로(>0). max_fill로 부풀리지 않음."""
@@ -2392,7 +2653,10 @@ class UpbitPrivateWS:
         if not currency:
             return
         with self._avg_sell_lock:
-            want = self.avg_sell_symbol == currency and self.avg_sell_cb
+            slot = self._avg_slots.get(currency)
+            want = bool(slot and slot.cb)
+            if want:
+                self._mirror_slot_to_flat(slot)
         if not want:
             return
         if avg_in_msg:
@@ -2419,22 +2683,23 @@ class UpbitPrivateWS:
             # myAsset: upbit flat / SIMPLE{ast:[…]} / bithumb {assets:[...]}
             assets = data.get('assets') or data.get('ast')
             if isinstance(assets, list):
-                want = self.avg_sell_symbol
-                want_avg_in_msg = False
-                # 1) 매도 대상 심볼을 먼저 반영 (다른 통화 파싱보다 우선)
-                if want:
+                with self._avg_sell_lock:
+                    wants = list(self._active_avg_symbols())
+                # 1) 매도 대상 심볼들 먼저 반영 (병렬 워커)
+                seen = set()
+                for want in wants:
                     for a in assets:
                         if not isinstance(a, dict):
                             continue
                         cu = a.get('currency') or a.get('cu')
                         if cu == want:
-                            _, want_avg_in_msg = self._ingest_asset_item(a)
+                            _, avg_in = self._ingest_asset_item(a)
                             self.asset_cache_time = time.monotonic()
                             self.asset_event.set()
-                            self._maybe_fire_avg_from_asset(
-                                want, want_avg_in_msg)
+                            self._maybe_fire_avg_from_asset(want, avg_in)
+                            seen.add(want)
                             break
-                # 2) 나머지 통화 캐시 (평단 핫패스 이후)
+                # 2) 나머지 통화 캐시
                 for a in assets:
                     self._ingest_asset_item(a)
                 self.asset_cache_time = time.monotonic()
@@ -2562,30 +2827,30 @@ class UpbitPrivateWS:
                 float(info.get('avg_buy_price', 0) or 0))
 
     def set_avg_sell_target(self, symbol, callback):
-        """사이클 시작 — 로컬 VWAP 스냅샷 + 매도 콜백 등록."""
+        """사이클 시작 — 로컬 VWAP 스냅샷 + 매도 콜백 등록 (심볼별 슬롯)."""
         with self._avg_sell_lock:
-            self.avg_sell_symbol = symbol
-            self.avg_sell_cb = callback
-            self._avg_sell_armed = False
-            self._avg_sell_vol_hint = 0.0
-            self._avg_sell_inflight = False
-            self._avg_sell_price_floor = 0.0
-            self._avg_sell_last_fired_avg = 0.0
-            self._avg_sell_fire_is_local = False
-            self._avg_sell_awaiting_rest = False
-            self._local_avg_rest_synced = False
-            self._avg_sell_fire_gen += 1
-            self._avg_rest_correct_gen += 1
+            slot = self._ensure_avg_slot(symbol)
+            slot.cb = callback
+            slot.armed = False
+            slot.vol_hint = 0.0
+            slot.inflight = False
+            slot.price_floor = 0.0
+            slot.last_fired_avg = 0.0
+            slot.fire_is_local = False
+            slot.awaiting_rest = False
+            slot.local_rest_synced = False
+            slot.fire_gen += 1
+            slot.rest_correct_gen += 1
             prev = self.asset_cache.get(symbol) or {}
             bal0 = float(prev.get('balance', 0) or 0)
             loc0 = float(prev.get('locked', 0) or 0)
             avg0 = float(prev.get('avg_buy_price', 0) or 0)
-            self._avg_sell_baseline_avg = avg0
-            self._avg_sell_baseline_t = float(self.asset_cache_time or 0)
-            self._avg_sell_prev_avg = avg0
-            self._avg_sell_prev_t = self._avg_sell_baseline_t
-            self._reset_local_avg_ledger(qty0=bal0 + loc0, avg0=avg0)
-        # 매수 전 스냅샷 정확도↑ — 핫 REST로 qty0/avg0 갱신(비차단)
+            slot.baseline_avg = avg0
+            slot.baseline_t = float(self.asset_cache_time or 0)
+            slot.prev_avg = avg0
+            slot.prev_t = slot.baseline_t
+            slot.reset_ledger(qty0=bal0 + loc0, avg0=avg0)
+            self._mirror_slot_to_flat(slot)
         self.prefetch_avg_rest(symbol)
 
         def _snap():
@@ -2595,20 +2860,22 @@ class UpbitPrivateWS:
                 if not info:
                     return
                 with self._avg_sell_lock:
-                    if self.avg_sell_symbol != symbol:
+                    slot = self._avg_slots.get(symbol)
+                    if not slot or slot.cb is None:
                         return
-                    # 이미 체결 누적됐으면 스냅샷 덮어쓰지 않음
-                    if self._local_avg_fill_vol > 1e-15:
+                    if slot.local_fill_vol > 1e-15:
                         return
                     bal = float(info.get('balance', 0) or 0)
                     loc = float(info.get('locked', 0) or 0)
                     avg = float(info.get('avg_buy_price', 0) or 0)
-                    self._reset_local_avg_ledger(qty0=bal + loc, avg0=avg)
-                    self._avg_sell_baseline_avg = avg
+                    slot.reset_ledger(qty0=bal + loc, avg0=avg)
+                    slot.baseline_avg = avg
                     self.asset_cache[symbol] = {
                         'balance': bal, 'locked': loc, 'avg_buy_price': avg,
                     }
                     self.asset_cache_time = time.monotonic()
+                    if self.avg_sell_symbol == symbol:
+                        self._mirror_slot_to_flat(slot)
             except Exception:
                 pass
 
@@ -2617,8 +2884,27 @@ class UpbitPrivateWS:
         except Exception:
             run_async(_snap)
 
-    def clear_avg_sell_target(self):
+    def clear_avg_sell_target(self, symbol=None):
+        """symbol 지정 시 해당 슬롯만, 없으면 전체 해제."""
         with self._avg_sell_lock:
+            if symbol:
+                slot = self._avg_slots.pop(symbol, None)
+                if slot:
+                    slot.clear_trading()
+                if self.avg_sell_symbol == symbol:
+                    self.avg_sell_symbol = None
+                    self.avg_sell_cb = None
+                    active = self._active_avg_symbols()
+                    if active:
+                        self._mirror_slot_to_flat(self._avg_slots[active[0]])
+                    else:
+                        self._avg_sell_armed = False
+                        self._avg_sell_inflight = False
+                        self._reset_local_avg_ledger(0.0, 0.0)
+                return
+            for sl in list(self._avg_slots.values()):
+                sl.clear_trading()
+            self._avg_slots.clear()
             self.avg_sell_symbol = None
             self.avg_sell_cb = None
             self._avg_sell_armed = False
@@ -2628,6 +2914,7 @@ class UpbitPrivateWS:
             self._avg_sell_baseline_t = 0.0
             self._avg_sell_price_floor = 0.0
             self._avg_sell_last_fired_avg = 0.0
+            self._avg_sell_last_fired_vol = 0.0
             self._avg_sell_fire_is_local = False
             self._avg_sell_awaiting_rest = False
             self._local_avg_rest_synced = False
@@ -2635,18 +2922,22 @@ class UpbitPrivateWS:
             self._avg_rest_correct_gen += 1
             self._reset_local_avg_ledger(0.0, 0.0)
 
-    def arm_avg_sell(self, vol_hint=0.0, fill_price=0.0, fill_uuid=None):
+    def arm_avg_sell(self, vol_hint=0.0, fill_price=0.0, fill_uuid=None,
+                     symbol=None):
         """매수 체결 → 로컬 VWAP 즉시 매도 + REST 교정 예약.
-        REST 평단 대기 없이 체결 데이터로 먼저 호가."""
+        REST 평단 대기 없이 체결 데이터로 먼저 호가.
+        ★ fill_uuid 없는 재arm은 장부 가산 금지(수량 2배 폭증 원흉)."""
         with self._avg_sell_lock:
-            if not self.avg_sell_cb or not self.avg_sell_symbol:
+            sym = symbol or self.avg_sell_symbol
+            slot = self._avg_slots.get(sym) if sym else None
+            if slot and slot.cb:
+                self._mirror_slot_to_flat(slot)
+            if not self.avg_sell_cb or not sym:
                 return False
+            self.avg_sell_symbol = sym
             self._avg_sell_prev_avg = float(self._avg_sell_baseline_avg or 0)
             self._avg_sell_prev_t = float(self._avg_sell_baseline_t or 0)
             self._avg_sell_armed = True
-            self._avg_sell_vol_hint = max(
-                float(self._avg_sell_vol_hint or 0), float(vol_hint or 0))
-            sym = self.avg_sell_symbol
         try:
             fp = float(fill_price or 0)
         except (TypeError, ValueError):
@@ -2655,17 +2946,35 @@ class UpbitPrivateWS:
             vh = float(vol_hint or 0)
         except (TypeError, ValueError):
             vh = 0.0
-        local = 0.0
-        if fp > 0 and vh > 0:
-            local = self.note_local_buy_fill(vh, fp, uuid=fill_uuid)
-        else:
-            local = self.compute_local_avg()
-        # 순수 VWAP만 — 패딩/max_fill 금지 (REST와 동일 스케일)
-        local = float(local or 0) or float(self.compute_local_avg() or 0)
         info = self.asset_cache.get(sym) or {}
         bal = float(info.get('balance', 0) or 0)
         locked = float(info.get('locked', 0) or 0)
-        vol = max(vh, bal + locked, self._local_total_vol_hint(vh))
+        held = max(0.0, bal) + max(0.0, locked)
+
+        local = 0.0
+        # ★ 실제 체결(uuid)만 장부 반영. 재arm/재시도는 가산 금지.
+        if fp > 0 and vh > 0 and fill_uuid:
+            local = self.note_local_buy_fill(vh, fp, uuid=fill_uuid)
+        else:
+            local = self.compute_local_avg()
+            if local <= 0 and fp > 0:
+                local = fp
+        local = float(local or 0) or float(self.compute_local_avg() or 0)
+
+        ledger = (float(self._local_avg_qty0 or 0)
+                  + float(self._local_avg_fill_vol or 0))
+        # ★ 매도 수량 = 실보유 우선. 없으면 장부/힌트 (힌트 눈덩이 금지)
+        if held >= float(MIN_HOLDING_VOLUME):
+            vol = held
+        else:
+            vol = max(vh, ledger)
+        with self._avg_sell_lock:
+            if held >= float(MIN_HOLDING_VOLUME):
+                self._avg_sell_vol_hint = held
+            else:
+                self._avg_sell_vol_hint = max(
+                    float(self._avg_sell_vol_hint or 0), float(vol or 0))
+
         fired = False
         if local > 0 and vol > 0:
             prev = self.asset_cache.get(sym) or {}
@@ -2680,34 +2989,50 @@ class UpbitPrivateWS:
             with self._avg_sell_lock:
                 already = float(self._avg_sell_last_fired_avg or 0) > 0
                 last_avg = float(self._avg_sell_last_fired_avg or 0)
+                last_vol = float(getattr(self, '_avg_sell_last_fired_vol', 0) or 0)
                 inflight = bool(self._avg_sell_inflight)
-            # 평단 틱 동일하면 콜백 재호출 금지 (매도 취소·재POST 루프 차단)
             same_avg = (
                 last_avg > 0
                 and abs(local - last_avg) / max(last_avg, 1e-12) < 3e-5)
-            if same_avg and already:
+            vol_grew = False
+            try:
+                vol_grew = (
+                    float(vol) > float(last_vol) + 1e-12
+                    and (float(vol) - float(last_vol)) * float(local)
+                    >= float(MIN_ORDER_AMOUNT))
+            except (TypeError, ValueError):
+                vol_grew = False
+            last_fire_t = float(getattr(self, '_avg_sell_last_fire_t', 0) or 0)
+            too_soon = (time.time() - last_fire_t) < 2.0
+            if same_avg and already and (not vol_grew or too_soon):
                 fired = True  # 이미 매도 경로 동작 중
-            elif inflight and same_avg:
+            elif inflight and same_avg and not vol_grew:
                 fired = True
             else:
                 fired = self.force_fire_avg_sell(local, vol)
-            if fired and not (same_avg and already):
+                if fired:
+                    with self._avg_sell_lock:
+                        self._avg_sell_last_fired_vol = float(vol or 0)
+                        self._avg_sell_last_fire_t = time.time()
+            if fired and (not (same_avg and already) or (vol_grew and not too_soon)):
                 print_log(LogLevel.INFO,
-                          f"로컬평단 매도 {'갱신' if already else 'fire'} "
-                          f"vwap={local:,.8f} "
+                          f"로컬평단 매도 {'수량갱신' if vol_grew else ('갱신' if already else 'fire')} "
+                          f"vwap={local:,.8f} vol={float(vol):.8f} "
                           f"(qty0={self._local_avg_qty0:.6f}+"
                           f"fills={self._local_avg_fill_vol:.6f})")
         # REST로 서버 평단 확정·호가 교정
         self._schedule_avg_rest_correct(sym)
         if not fired:
             self._schedule_avg_rest_fire(sym)
+        with self._avg_sell_lock:
+            slot = self._avg_slots.get(sym)
+            if slot:
+                self._mirror_flat_to_slot(slot)
         return fired
 
     def _arm_avg_sell_from_order(self, order):
         """myOrder 매수 체결 → 메인루프보다 먼저 arm (WS 스레드, non-blocking)."""
         try:
-            if not self.avg_sell_cb or not self.avg_sell_symbol:
-                return
             if not isinstance(order, dict):
                 return
             order = normalize_order(order)
@@ -2719,8 +3044,16 @@ class UpbitPrivateWS:
             if side != 'bid':
                 return
             market = order.get('market') or order.get('code') or ''
-            want = f'KRW-{self.avg_sell_symbol}'
-            if market and market != want:
+            with self._avg_sell_lock:
+                targets = self._active_avg_symbols()
+            if not targets:
+                return
+            sym = None
+            for t in targets:
+                if (not market) or market == f'KRW-{t}':
+                    sym = t
+                    break
+            if not sym:
                 return
             state = str(order.get('state', '') or '').lower()
             if not (order_is_filled(order) or state == 'trade'):
@@ -2738,7 +3071,7 @@ class UpbitPrivateWS:
                 except (TypeError, ValueError):
                     fill_px = 0.0
             self.arm_avg_sell(
-                vol_hint=vol, fill_price=fill_px, fill_uuid=uid)
+                vol_hint=vol, fill_price=fill_px, fill_uuid=uid, symbol=sym)
         except Exception:
             pass
 
@@ -2816,8 +3149,17 @@ class UpbitPrivateWS:
             self._avg_sell_inflight = True
             gen = self._avg_sell_fire_gen
             cb = self.avg_sell_cb
-            vol_f = max(float(vol or 0), float(self._avg_sell_vol_hint or 0),
-                        self._local_total_vol_hint(vol))
+            # ★ vol 눈덩이 금지 — 실보유 있으면 그걸로 고정
+            info = self.asset_cache.get(self.avg_sell_symbol) or {}
+            held = (max(float(info.get('balance', 0) or 0), 0.0)
+                    + max(float(info.get('locked', 0) or 0), 0.0))
+            ledger = (float(self._local_avg_qty0 or 0)
+                      + float(self._local_avg_fill_vol or 0))
+            if held >= float(MIN_HOLDING_VOLUME):
+                vol_f = held
+            else:
+                vol_f = max(float(vol or 0), ledger,
+                            float(self._avg_sell_vol_hint or 0))
             self._avg_sell_baseline_avg = avg_f
             self._avg_sell_baseline_t = float(self.asset_cache_time or 0)
             self._avg_sell_last_fired_avg = avg_f
@@ -2870,10 +3212,27 @@ class UpbitPrivateWS:
             # 아주 작은 차이도 호가틱이 바뀔 수 있음(저가코인) — 1e-12 절대/상대
             differs = (last <= 0) or (
                 abs(avg_f - last) > max(last * 1e-8, 1e-12))
-            if not differs:
+            last_vol = float(getattr(self, '_avg_sell_last_fired_vol', 0) or 0)
+            vol_f_pre = max(float(vol or 0), self._local_total_vol_hint())
+            # 실보유 있으면 그걸로 cap (재arm 폭증 방지)
+            try:
+                info = self.asset_cache.get(self.avg_sell_symbol) or {}
+                held = (max(float(info.get('balance', 0) or 0), 0.0)
+                        + max(float(info.get('locked', 0) or 0), 0.0))
+                if held >= float(MIN_HOLDING_VOLUME):
+                    vol_f_pre = held
+            except Exception:
+                pass
+            vol_grew = (
+                vol_f_pre > last_vol + 1e-12
+                and (vol_f_pre - last_vol) * avg_f >= float(MIN_ORDER_AMOUNT))
+            if not differs and not vol_grew:
                 self._avg_sell_awaiting_rest = False
                 return False
-            if not awaiting and last > 0 and avg_f <= last * 1.00005:
+            if (not differs and vol_grew):
+                # 평단 동일·수량만 증가 → 합산 매도
+                pass
+            elif not awaiting and last > 0 and avg_f <= last * 1.00005:
                 return False
             if self._avg_sell_inflight:
                 # sleep 재시도 금지 — 현재 fire 종료 직후 즉시 교정
@@ -2881,9 +3240,10 @@ class UpbitPrivateWS:
                 return True
             gen = self._avg_sell_fire_gen
             cb = self.avg_sell_cb
-            vol_f = max(float(vol or 0), self._local_total_vol_hint(vol))
+            vol_f = vol_f_pre
             self._avg_sell_inflight = True
             self._avg_sell_last_fired_avg = avg_f
+            self._avg_sell_last_fired_vol = vol_f
             self._avg_sell_baseline_avg = avg_f
             self._avg_sell_awaiting_rest = False
 
@@ -2982,86 +3342,85 @@ private_ws = UpbitPrivateWS()
 
 
 class VolatilityScanner:
-    """웹소켓 candle.1m 기반 실시간 변동성 스캐너.
-    전체 KRW 마켓의 1분캔들 20개 종가를 유지하고, 표준편차/평균(CV)로 랭킹.
-    REST로 초기 20개 seed → 웹소켓 candle.1m로 실시간 갱신."""
+    """ticker/all 1회 기반 변동성 스캐너 (전종목 캔들 REST 금지 → rate limit 회피).
 
-    CANDLE_COUNT = 20
-    VOLUME_THRESHOLD_M = 5000  # 24시간 거래대금 하한 (백만원) = 50억원
-    SEED_SLEEP = 0.05          # REST seed 시 코인당 대기 (rate limit)
+    1차 점수 = (당일고가−당일저가)/현재가  (없으면 |signed_change_rate|)
+    + 24h 거래대금 ≥ VOLUME_THRESHOLD_M
+    주기적으로 ticker/all 만 갱신. HybridMA 시드는 상위 후보만 cycle_runner가 수행."""
+
+    CANDLE_COUNT = 20  # 레거시 호환 (더 이상 전종목 시드 안 함)
+    VOLUME_THRESHOLD_M = 5000  # 백만원 = 50억 (config로 덮어씀)
+    TICKER_REFRESH_S = 15.0
 
     def __init__(self):
-        self.candle_buffers = {}   # {symbol: deque([close,...], maxlen=20)}
-        self.volume_1h = {}        # {symbol: 1시간 거래대금(백만원)}
+        try:
+            from .config import VOLUME_THRESHOLD_M, TICKER_RANK_REFRESH_S
+            self.VOLUME_THRESHOLD_M = float(VOLUME_THRESHOLD_M)
+            self.TICKER_REFRESH_S = float(TICKER_RANK_REFRESH_S)
+        except Exception:
+            pass
+        self.candle_buffers = {}   # 레거시 호환 (비어 있을 수 있음)
+        self.volume_1h = {}        # {symbol: 24h 거래대금(백만원)}
+        self.ticker_snap = {}      # {symbol: {price, high, low, change_rate, range_pct, vol_m}}
         self.symbols = []
         self.ws = None
         self.thread = None
+        self._bg_thread = None
         self.is_running = False
-        self._should_reconnect = True
+        self._should_reconnect = False  # ticker 폴링 모드 — candle WS 기본 OFF
         self._connect_gen = 0
         self._last_ws_error = ''
         self._ws_err_log_at = 0.0
+        self._bg_stop = threading.Event()
+        self._lock = threading.RLock()
+        self._last_top_log_ts = 0.0
+        self._last_refresh_ts = 0.0
 
     def start(self, symbols):
-        """1) REST seed (각 코인 1분캔들 20개 + ticker 24h 거래대금)
-           2) 웹소켓 candle.1m 다중 구독 시작"""
-        self.symbols = list(symbols)
-        print_log(LogLevel.INFO, f"VolatilityScanner 시작 — {len(self.symbols)}개 코인 seed")
-        # REST seed
-        self._seed_candles()
-        print_log(LogLevel.SUCCESS,
-                  f"Seed 완료 — {len(self.candle_buffers)}개 코인 버퍼 준비")
-        if self.thread and self.thread.is_alive():
-            self._connect_gen += 1
-            self._should_reconnect = False
-            if self.ws:
-                try:
-                    self.ws.close()
-                except Exception:
-                    pass
-        self._connect_gen += 1
-        self._should_reconnect = True
+        """ticker/all 1회 시드 + 백그라운드 주기 갱신. 전종목 캔들 REST 없음."""
+        self.symbols = [str(s).upper() for s in (symbols or []) if s]
+        print_log(
+            LogLevel.INFO,
+            f"VolatilityScanner 시작 — ticker/all 랭킹 "
+            f"(후보풀={len(self.symbols)}, 갱신={self.TICKER_REFRESH_S:.0f}s)")
+        n = self._refresh_tickers()
+        print_log(
+            LogLevel.SUCCESS,
+            f"ticker/all seed 완료 — {n}개 스냅샷 "
+            f"(유동성≥{int(self.VOLUME_THRESHOLD_M)}M)")
         self.is_running = True
-        gen = self._connect_gen
-        self.thread = threading.Thread(
-            target=self._connect_loop, args=(gen,), daemon=True)
-        self.thread.start()
+        self._bg_stop.clear()
+        if self._bg_thread and self._bg_thread.is_alive():
+            pass
+        else:
+            self._bg_thread = threading.Thread(
+                target=self._ticker_bg_loop, name='vol-ticker-bg', daemon=True)
+            self._bg_thread.start()
 
     def stop(self):
-        self._connect_gen += 1
-        self._should_reconnect = False
         self.is_running = False
+        self._bg_stop.set()
+        self._should_reconnect = False
+        self._connect_gen += 1
         if self.ws:
             try:
                 self.ws.close()
             except Exception:
                 pass
 
-    def _seed_one(self, symbol):
-        """코인 1개 seed — 1분캔들 20개만 조회. (병렬 워커용)
-        거래대금은 _seed_candles에서 ticker 1회 호출로 전 코인 처리.
-        반환: (symbol, closes_or_None)"""
-        try:
-            qs = {"market": f"KRW-{symbol}", "count": str(self.CANDLE_COUNT)}
-            def api_call():
-                r = http_get(CANDLE_URL, params=qs, timeout=HTTP_TIMEOUT_SLOW, slow=True)
-                return response_json(r)
-            candles = safe_api_call(api_call)
-            if candles and len(candles) >= self.CANDLE_COUNT:
-                # API는 최신→과거 순서 → 역순(과거→최신)
-                return (symbol, [float(c['trade_price']) for c in reversed(candles)])
-            return (symbol, None)
-        except Exception:
-            return (symbol, None)
+    def _ticker_bg_loop(self):
+        while not self._bg_stop.wait(self.TICKER_REFRESH_S):
+            if not self.is_running:
+                break
+            try:
+                self._refresh_tickers()
+            except Exception:
+                pass
 
-    def _seed_candles(self):
-        """REST로 1분캔들 20개(코인별 병렬) + 24h 거래대금(ticker 1회) 수집 → 버퍼 초기화."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        # 1) 거래대금 — 업비트 GET /v1/ticker/all?quote_currencies=KRW (전 종목 1회)
-        #    미지원 시 레거시 GET /v1/ticker?markets=...
+    def _fetch_ticker_all(self):
+        """KRW 전종목 ticker 1회. 실패 시 None."""
+        tickers = None
         try:
-            tickers = None
             if EXCHANGE.get('supports_ticker_all') and EXCHANGE.get('ticker_all_endpoint'):
                 def ticker_all_call():
                     r = http_get(
@@ -3070,204 +3429,198 @@ class VolatilityScanner:
                         timeout=HTTP_TIMEOUT_SLOW, slow=True)
                     return response_json(r)
                 tickers = safe_api_call(ticker_all_call)
-                src = "ticker/all"
-            if not tickers:
-                markets_param = ",".join(f"KRW-{s}" for s in self.symbols)
-                def ticker_call():
-                    r = http_get(TICKER_URL, params={"markets": markets_param},
-                                 timeout=HTTP_TIMEOUT_SLOW, slow=True)
-                    return response_json(r)
-                tickers = safe_api_call(ticker_call)
-                src = "ticker"
-            if tickers:
-                wanted = set(self.symbols)
-                for t in tickers:
-                    code = t.get('market', '')
-                    if code.startswith('KRW-'):
-                        sym = code[4:]
-                        if wanted and sym not in wanted:
-                            continue
-                        # acc_trade_price_24h: 원 단위 → 백만 원 단위
-                        self.volume_1h[sym] = float(t.get('acc_trade_price_24h', 0)) / 1000000
-                print_log(LogLevel.INFO,
-                          f"거래대금 seed 완료 — {src} 1회로 "
-                          f"{len(self.volume_1h)}개 코인")
         except Exception as e:
-            print_log(LogLevel.WARNING, f"ticker 거래대금 seed 실패: {str(e)[:100]}")
+            print_log(LogLevel.WARNING, f"ticker/all 실패: {str(e)[:100]}")
+            tickers = None
+        if tickers:
+            return tickers
+        # 폴백: 심볼 배치 (가능하면 피함)
+        if not self.symbols:
+            return None
+        try:
+            markets_param = ",".join(f"KRW-{s}" for s in self.symbols[:100])
+            def ticker_call():
+                r = http_get(TICKER_URL, params={"markets": markets_param},
+                             timeout=HTTP_TIMEOUT_SLOW, slow=True)
+                return response_json(r)
+            return safe_api_call(ticker_call)
+        except Exception:
+            return None
 
-        # 2) 1분캔들 20개 — 병렬 수집 (업비트 캔들 rate limit 초당 10회 준수)
-        seeded = 0
-        failed = 0
-        lock = threading.Lock()
-        pbar = tqdm(total=len(self.symbols), desc="VolatilityScanner seed", leave=False)
-        # rate limit(10/s)을 넘지 않도록 병렬도 제한 — 캔들 호출만 카운트
-        max_workers = min(8, (len(self.symbols) or 1))
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(self._seed_one, s) for s in self.symbols]
-            for fut in as_completed(futures):
-                symbol, closes = fut.result()
-                with lock:
-                    if closes:
-                        self.candle_buffers[symbol] = deque(closes, maxlen=self.CANDLE_COUNT)
-                        seeded += 1
-                    else:
-                        failed += 1
-                    pbar.update(1)
-                    pbar.set_postfix(ok=seeded, fail=failed)
-        pbar.close()
+    @staticmethod
+    def _range_score(high, low, price, change_rate):
+        """1차 변동성 점수. 당일 고저폭 우선, 없으면 |등락률|."""
+        try:
+            high = float(high or 0)
+            low = float(low or 0)
+            price = float(price or 0)
+            cr = abs(float(change_rate or 0))
+        except (TypeError, ValueError):
+            return 0.0
+        if price > 0 and high >= low and high > 0:
+            rng = (high - low) / price
+            if rng > 0:
+                return rng
+        return cr if cr > 0 else 0.0
+
+    def _refresh_tickers(self):
+        """ticker/all → volume/range 스냅샷. 반환=갱신 심볼 수."""
+        tickers = self._fetch_ticker_all()
+        if not tickers:
+            return 0
+        wanted = set(self.symbols) if self.symbols else None
+        snap = {}
+        vol_map = {}
+        for t in tickers:
+            code = t.get('market', '')
+            if not code.startswith('KRW-'):
+                continue
+            sym = code[4:].upper()
+            if wanted is not None and sym not in wanted:
+                continue
+            try:
+                price = float(t.get('trade_price') or 0)
+                high = float(t.get('high_price') or 0)
+                low = float(t.get('low_price') or 0)
+                cr = float(t.get('signed_change_rate')
+                           if t.get('signed_change_rate') is not None
+                           else (t.get('change_rate') or 0))
+                vol_m = float(t.get('acc_trade_price_24h') or 0) / 1_000_000.0
+            except (TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            score = self._range_score(high, low, price, cr)
+            snap[sym] = {
+                'price': price,
+                'high': high,
+                'low': low,
+                'change_rate': cr,
+                'range_pct': score,
+                'vol_m': vol_m,
+            }
+            vol_map[sym] = vol_m
+        with self._lock:
+            self.ticker_snap = snap
+            self.volume_1h = vol_map
+            self._last_refresh_ts = time.time()
+        return len(snap)
+
+    # ── 레거시 스텁 (호출부 호환) ──
+    def _seed_one(self, symbol):
+        return (symbol, None)
+
+    def _seed_candles(self):
+        return self._refresh_tickers()
 
     def _connect_loop(self, gen):
-        """재연결 루프 — gen 가드 + 429 지수 백오프."""
-        attempt = 0
-        while self._should_reconnect and self.is_running and self._connect_gen == gen:
-            try:
-                self.ws = websocket.WebSocketApp(
-                    UpbitWebSocket.WS_URL,
-                    on_open=self._on_open,
-                    on_message=self._on_message,
-                    on_error=self._on_error,
-                    on_close=self._on_close
-                )
-                _ws_run_forever(self.ws)
-                attempt = 0
-            except Exception as e:
-                self._last_ws_error = str(e)
-                now = time.time()
-                if now - self._ws_err_log_at >= 2.0:
-                    self._ws_err_log_at = now
-                    print_log(LogLevel.WARNING, f"VolatilityScanner WS 오류: {str(e)[:100]}")
-            if not self._should_reconnect or not self.is_running or self._connect_gen != gen:
-                break
-            delay = _ws_backoff_seconds(self._last_ws_error, attempt)
-            attempt += 1
-            if delay > 0:
-                time.sleep(delay)
+        return
 
     def _on_open(self, ws):
-        codes = [f"KRW-{s}" for s in self.symbols if s in self.candle_buffers]
-        # 업비트 구독 제한 고려 — 한 번에 전체 구독
-        req = ([{"ticket": f"vscanner-{int(time.time())}"},
-                {"type": "candle.1m", "codes": codes}]
-               + _ws_format_extra())
-        _ws_send_json(ws, req)
-        print_log(LogLevel.SUCCESS,
-                  f"VolatilityScanner WS 구독 — {len(codes)}개 코인 candle.1m")
+        pass
 
     def _on_message(self, ws, message):
-        """candle.1m 메시지 파싱 → 버퍼 갱신 (롤링 20개) + 거래대금 누적."""
-        try:
-            data = json_loads(message)
-            code = data.get('code') or data.get('cd') or ''
-            if not code.startswith('KRW-'):
-                return
-            symbol = code[4:]
-            close = data.get('trade_price', data.get('tp'))
-            if close is None:
-                return
-            close = float(close)
-            # 버퍼 갱신
-            if symbol not in self.candle_buffers:
-                self.candle_buffers[symbol] = deque(maxlen=self.CANDLE_COUNT)
-            self.candle_buffers[symbol].append(close)
-            # 거래대금 누적 (해당 1분 캔들의 누적 거래대금)
-            acc_price = data.get('candle_acc_trade_price')
-            if acc_price:
-                # candle.1m는 매 tick 마다 진행 중인 캔들을 갱신 push 함.
-                # 단순화: 최신 캔들의 acc_trade_price 를 1시간 합산의 근사로 사용
-                pass
-        except Exception:
-            pass
+        pass
 
     def _on_error(self, ws, error):
-        self._last_ws_error = str(error)
-        now = time.time()
-        if now - self._ws_err_log_at >= 2.0:
-            self._ws_err_log_at = now
-            print_log(LogLevel.WARNING, f"VolatilityScanner WS 에러: {str(error)[:100]}")
+        pass
 
     def _on_close(self, ws, close_status, close_msg):
         pass
 
     def _calc_volatility(self, symbol):
-        """std(close[-20:]) / mean(close[-20:]) — 변동계수(CV).
-        deque를 직접 순회 (list 복사 생략)."""
-        buf = self.candle_buffers.get(symbol)
-        if not buf or len(buf) < self.CANDLE_COUNT:
+        """ticker range_pct (레거시 이름 유지)."""
+        with self._lock:
+            ent = self.ticker_snap.get(str(symbol).upper())
+        if not ent:
             return 0.0
-        n = len(buf)
-        mean = sum(buf) / n  # deque 직접 sum
-        if mean <= 0:
-            return 0.0
-        var = sum((x - mean) ** 2 for x in buf) / n
-        return (var ** 0.5) / mean
+        return float(ent.get('range_pct') or 0.0)
+
+    def get_top_volatility_symbols(self, n=20, excluded_symbols=None):
+        """ticker/all 변동성(고저폭) 내림차순 Top n.
+        Returns: list[(symbol, score, price)]
+        필터: 호가제외구간, 거래대금, excluded."""
+        if excluded_symbols is None:
+            excluded = set()
+        else:
+            excluded = {str(s).upper() for s in excluded_symbols}
+        n = max(1, int(n or 1))
+        # 너무 오래됐으면 동기 1회 갱신 (핫패스 드묾)
+        if time.time() - float(self._last_refresh_ts or 0) > self.TICKER_REFRESH_S * 2:
+            try:
+                self._refresh_tickers()
+            except Exception:
+                pass
+        with self._lock:
+            items = list(self.ticker_snap.items())
+        candidates = []
+        for sym, ent in items:
+            su = str(sym).upper()
+            if su in excluded:
+                continue
+            price = float(ent.get('price') or 0)
+            if price <= 0:
+                continue
+            if UpbitTickSystem.is_excluded_tick_range(price):
+                continue
+            vol_m = float(ent.get('vol_m') or self.volume_1h.get(su, 0) or 0)
+            if vol_m < self.VOLUME_THRESHOLD_M:
+                continue
+            score = float(ent.get('range_pct') or 0)
+            if score <= 0:
+                continue
+            candidates.append((su, score, price))
+        if not candidates:
+            return []
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        top = candidates[:n]
+        now = time.time()
+        if now - float(self._last_top_log_ts or 0) >= 30.0:
+            self._last_top_log_ts = now
+            for i, (sym, score, price) in enumerate(top[:5]):
+                print_log(
+                    LogLevel.INFO,
+                    f"  Vol Top{i+1}: {sym} range={score*100:.2f}% @{price:,.4f} "
+                    f"vol24h={self.volume_1h.get(sym, 0):,.0f}M")
+        return top
 
     def get_top_volatility_symbol(self, excluded_symbols=None):
-        """필터 통과한 코인 중 변동성 최고 심볼 반환.
-        각 코인 버퍼에서 변동계수(CV) = std/mean 계산 후 정렬.
-        필터: is_excluded_tick_range, 거래대금 < 1000백만원, excluded_symbols."""
-        if excluded_symbols is None:
-            excluded_symbols = set()
-        candidates = []
-        for symbol in list(self.candle_buffers.keys()):
-            if symbol in excluded_symbols:
-                continue
-            buf = self.candle_buffers.get(symbol)
-            if not buf or len(buf) < self.CANDLE_COUNT:
-                continue
-            latest_price = buf[-1]
-            if latest_price <= 0:
-                continue
-            # 호가 제외 구간
-            if UpbitTickSystem.is_excluded_tick_range(latest_price):
-                continue
-            # 거래대금 필터
-            if self.volume_1h.get(symbol, 0) < self.VOLUME_THRESHOLD_M:
-                continue
-            vol = self._calc_volatility(symbol)
-            if vol > 0:
-                candidates.append((symbol, vol, latest_price))
-
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x[1], reverse=True)  # 변동성 내림차순
-        # Top 5 로그
-        for i, (sym, vol, price) in enumerate(candidates[:5]):
-            print_log(LogLevel.INFO,
-                      f"  Vol Top{i+1}: {sym} CV={vol:.6f} @{price:,.4f} "
-                      f"vol1h={self.volume_1h.get(sym,0):,.0f}M")
-        return candidates[0][0]
+        """필터 통과한 코인 중 변동성 최고 심볼 반환 (하위 호환)."""
+        top = self.get_top_volatility_symbols(1, excluded_symbols=excluded_symbols)
+        return top[0][0] if top else None
 
 
-# 전역 trade(체결가) 스트림 싱글톤 — 60틱 MA20 매수 게이트용.
+# 전역 trade(체결가) 스트림 싱글톤 — 60틱 MA60 매수 게이트용.
 # 모듈 임포트 시점에 생성하되 WS 연결은 subscribe(symbol) 호출 전까지 대기.
 trade_ws = TradeTickStream() if WEBSOCKET_AVAILABLE else None
+# AUTO_SELECT 스캐너 — main에서 start 후 할당
+volatility_scanner = None
 
 
 class RealMarketData:
     # 웹소켓 싱글톤 (라이브러리 사용 가능 시만)
     _ws = UpbitWebSocket() if WEBSOCKET_AVAILABLE else None
+    _rest_ticker_cache = {}  # {symbol: (price, ts)}
+    _REST_TICKER_TTL = 1.0
+    _PRICE_SANE_RATIO = 0.25  # 심볼 시세와 25% 이상 괴리 = 오염
 
     @staticmethod
-    def get_current_price(symbol):
-        # 1) trade 스트림 체결가 우선 — 다중 심볼 동시 구독 시 심볼별 최신가가
-        #    ticker(단일 구독)에 없어도 스탑로스/게이트가 올바른 심볼 가격을 씀.
-        if trade_ws:
-            last = trade_ws.get_last_price(symbol)
-            if last is not None:
-                return last
-        # 2) ticker 웹소켓 캐시 (핫 루프 — API 호출 없음)
-        if RealMarketData._ws:
-            cached = RealMarketData._ws.get_price(symbol)
-            if cached is not None:
-                return cached
-        # 3) 폴백: REST (웹소켓 미가동/캐시 만료 시)
+    def _rest_ticker(symbol, ttl=None):
+        """심볼별 REST ticker (짧은 캐시). 오염 검증/폴백용."""
+        if not symbol:
+            return None
+        su = str(symbol).upper()
+        ttl = RealMarketData._REST_TICKER_TTL if ttl is None else ttl
+        ent = RealMarketData._rest_ticker_cache.get(su)
+        now = time.time()
+        if ent and (now - ent[1]) < ttl:
+            return ent[0]
         try:
             def api_call():
-                url = f"{TICKER_URL}?markets=KRW-{symbol}"
+                url = f"{TICKER_URL}?markets=KRW-{su}"
                 headers = {"Accept": "application/json"}
                 response = http_get(url, headers=headers, timeout=HTTP_TIMEOUT_SLOW,
                                     slow=True)
-
                 if response.status_code == 200:
                     data = response_json(response)
                     if data and len(data) > 0:
@@ -3276,13 +3629,71 @@ class RealMarketData:
                     print_log(LogLevel.WARNING, "API rate limit exceeded")
                     return None
                 else:
-                    print_log(LogLevel.WARNING, f"Failed to get current price: {response.status_code}")
+                    print_log(LogLevel.WARNING,
+                              f"Failed to get current price: {response.status_code}")
                     return None
 
-            return safe_api_call(api_call)
+            px = safe_api_call(api_call)
+            if px and px > 0:
+                RealMarketData._rest_ticker_cache[su] = (px, now)
+            return px
         except Exception as e:
             print_log(LogLevel.EXCEPTION, f"Error getting current price: {str(e)}")
             return None
+
+    @staticmethod
+    def sanitize_symbol_price(symbol, price, *, force_rest=False):
+        """다른 코인 시세 오염 차단 — 기준가와 25%+ 괴리면 ref로 교체.
+        핫패스: CRIX pending만 비교 (REST 없음).
+        force_rest=True: REST ticker로 최종 검증 (핫패스 매수/매도는 False — WS만).
+        Returns: (clean_price, contaminated: bool)"""
+        if not symbol or not price or price <= 0:
+            return None, False
+        su = str(symbol).upper()
+        price = float(price)
+        ref = None
+        if trade_ws:
+            pending = getattr(trade_ws, '_pending_close', {}).get(su)
+            try:
+                if pending and float(pending) > 0:
+                    ref = float(pending)
+            except (TypeError, ValueError):
+                pass
+        if force_rest or ref is None:
+            # force_rest이거나 pending 없을 때만 REST (매수 직전)
+            if force_rest:
+                rest = RealMarketData._rest_ticker(su)
+                if rest and rest > 0:
+                    ref = rest
+        if ref and ref > 0:
+            if abs(price - ref) / ref > RealMarketData._PRICE_SANE_RATIO:
+                print_log(
+                    LogLevel.ERROR,
+                    f"PRICE CONTAMINATION {su}: got={price} ref={ref} "
+                    f"— 다른코인 시세 의심, ref 사용")
+                return ref, True
+        return price, False
+
+    @staticmethod
+    def get_current_price(symbol):
+        # 1) trade 스트림 체결가 우선 — 다중 심볼 동시 구독 시 심볼별 최신가가
+        #    ticker(단일 구독)에 없어도 스탑로스/게이트가 올바른 심볼 가격을 씀.
+        if not symbol:
+            return None
+        su = str(symbol).upper()
+        if trade_ws:
+            last = trade_ws.get_last_price(su)
+            if last is not None:
+                clean, _bad = RealMarketData.sanitize_symbol_price(su, last)
+                return clean if clean else last
+        # 2) ticker 웹소켓 캐시 (핫 루프 — API 호출 없음)
+        if RealMarketData._ws:
+            cached = RealMarketData._ws.get_price(su)
+            if cached is not None:
+                clean, _bad = RealMarketData.sanitize_symbol_price(su, cached)
+                return clean if clean else cached
+        # 3) 폴백: REST (웹소켓 미가동/캐시 만료 시)
+        return RealMarketData._rest_ticker(su)
 
     @staticmethod
     def subscribe_websocket(symbol):
@@ -3294,51 +3705,112 @@ class RealMarketData:
 
     @staticmethod
     def subscribe_trade_stream(symbol):
-        """체결가(trade) 스트림 구독 시작 — 60틱 MA20 게이트용. 단일 심볼 (호환)."""
-        if trade_ws:
-            trade_ws.subscribe(symbol)
+        """체결가(trade) 스트림 — 단일 심볼을 기존 다중 구독에 추가 (덮어쓰기 금지).
+        1분 MA 시드도 함께 (하이브리드 게이트)."""
+        if trade_ws and symbol:
+            trade_ws.ensure_symbols([str(symbol).upper()])
+        try:
+            if minute_ma_cache is not None and symbol:
+                minute_ma_cache.ensure(symbol)
+        except Exception:
+            pass
 
     @staticmethod
     def subscribe_trade_stream_symbols(symbols):
-        """체결가(trade) 스트림 다중 심볼 동시 구독 — 60틱 MA20 게이트용.
-        복수 심볼의 MA20을 동시에 산출하여 다중 심볼 폴백을 즉시 지원."""
-        if trade_ws and symbols:
-            trade_ws.subscribe_symbols(symbols)
+        """체결가(trade) 스트림 다중 심볼 동시 구독 — 기존 구독에 합집합.
+        1분 MA 시드도 함께."""
+        cleaned = [str(s).upper() for s in (symbols or []) if s]
+        if trade_ws and cleaned:
+            trade_ws.ensure_symbols(cleaned)
+        try:
+            if minute_ma_cache is not None and cleaned:
+                minute_ma_cache.ensure(cleaned)
+        except Exception:
+            pass
+
+    @staticmethod
+    def compute_hybrid_ma(symbol):
+        """틱 MA60 + 1분 MA60 → 괴리 적응형 합성.
+        Returns: (hybrid|None, info: dict) — 핫패스 REST 없음."""
+        try:
+            from .config import HYBRID_MA_DIV_K
+            k = float(HYBRID_MA_DIV_K)
+        except Exception:
+            k = 8.0
+        info = {
+            'ma_tick': None, 'ma_min': None, 'hybrid': None,
+            'ma60': None, 'ma25': None, 'ma20': None,
+            'w_tick': None, 'w_min': None, 'div': None,
+            'last_price': None, 'candle_count': 0, 'tick_progress': 0,
+            'min_candle_count': 0,
+        }
+        if trade_ws is None:
+            return None, info
+        ma_tick = trade_ws.get_ma60(symbol)
+        ma_min = None
+        try:
+            if minute_ma_cache is not None:
+                ma_min = minute_ma_cache.get_ma60(symbol)
+                info['min_candle_count'] = minute_ma_cache.get_buffer_size(symbol)
+        except Exception:
+            ma_min = None
+        info['ma_tick'] = ma_tick
+        info['ma_min'] = ma_min
+        info['candle_count'] = trade_ws.get_buffer_size(symbol)
+        info['tick_progress'] = trade_ws.get_tick_progress(symbol)
+        if ma_tick is None or ma_min is None or ma_min <= 0:
+            return None, info
+        div = abs(float(ma_tick) - float(ma_min)) / float(ma_min)
+        # 정렬→0.5/0.5, 괴리↑→분 가중↑ (틱 최소 0.2)
+        w_tick = 0.5 - k * div
+        if w_tick < 0.2:
+            w_tick = 0.2
+        elif w_tick > 0.8:
+            w_tick = 0.8
+        w_min = 1.0 - w_tick
+        hybrid = w_tick * float(ma_tick) + w_min * float(ma_min)
+        info['div'] = div
+        info['w_tick'] = w_tick
+        info['w_min'] = w_min
+        info['hybrid'] = hybrid
+        info['ma60'] = hybrid
+        info['ma25'] = hybrid
+        info['ma20'] = hybrid
+        return hybrid, info
 
     @staticmethod
     def check_tick_ma_gate(symbol):
-        """60틱 캔들(업비트 60T) 기반 MA20 매수 진입 게이트.
-          - MA20 = 최근 20개 60틱 캔들(체결 1,200개분) 종가의 단순이동평균
-          - 현재가 < MA20 → 매수 허용 (True)
-          - 현재가 ≥ MA20 → 매수 금지/대기 (False, 절대 금지)
-          - trade_ws 미가용 또는 캔들 < 20개(1,200틱 미축적) → 매수 대기 (False)
+        """하이브리드 MA 매수 진입 게이트 (틱 MA60 + 1분 MA60).
+          - 분봉 MA = hard filter (합의/세력스파이크 차단)
+          - hybrid = 괴리 적응형 합성 (정렬 시 ≈1:1)
+          - 허용: price < ma_min AND price < hybrid
+          - 어느 한쪽 MA 미준비 → 대기 (False)
         Returns: (allowed: bool, info: dict)."""
-        info = {'ma20': None, 'last_price': None, 'candle_count': 0, 'tick_progress': 0}
+        hybrid, info = RealMarketData.compute_hybrid_ma(symbol)
+        last_price = RealMarketData.get_current_price(symbol)
+        info['last_price'] = last_price
         if trade_ws is None:
             return False, info
-        ma20 = trade_ws.get_ma20(symbol)
-        last_price = RealMarketData.get_current_price(symbol)
-        candle_count = trade_ws.get_buffer_size(symbol)
-        tick_progress = trade_ws.get_tick_progress(symbol)
-        info['ma20'] = ma20
-        info['last_price'] = last_price
-        info['candle_count'] = candle_count
-        info['tick_progress'] = tick_progress
-
-        # 캔들 부족 — 1,200틱(20 캔들)이 쌓일 때까지 대기
-        if ma20 is None:
+        if hybrid is None:
+            # 미시드면 ensure만 걸고 대기 (핫패스 REST 없음 — bg/seed가 채움)
+            try:
+                if minute_ma_cache is not None and symbol:
+                    minute_ma_cache.ensure(symbol)
+            except Exception:
+                pass
             return False, info
-        # 현재가 조회 실패 — 대기
         if last_price is None:
             return False, info
-
-        return (last_price < ma20), info
+        ma_min = info.get('ma_min')
+        if ma_min is None:
+            return False, info
+        return (last_price < ma_min and last_price < hybrid), info
 
     @staticmethod
     def select_first_tradable_symbol(symbols):
         """다중 심볼 폴백 — 주어진 심볼 리스트를 기재 순서대로 순회하며
-        첫 번째로 MA20 게이트를 통과하는(매수 가능한) 심볼을 반환.
-        게이트 판정은 check_tick_ma_gate()와 동일 (현재가 < MA20).
+        첫 번째로 하이브리드 MA 게이트를 통과하는(매수 가능한) 심볼을 반환.
+        게이트 판정은 check_tick_ma_gate()와 동일.
         단, 게이트 산출이 불가능한 심볼(trade_ws 미가용 등)은 통과로 간주하여
         기존 단일 심볼 동작을 보존.
         Returns: (selected_symbol: str|None, tried: list[(symbol, allowed, reason)])"""
@@ -3350,26 +3822,39 @@ class RealMarketData:
                 return symbols[0], tried
             return None, tried
 
+        need = int(getattr(trade_ws, 'MA_PERIOD', 60) or 60)
         for sym in symbols:
-            # 게이트 산출 전제 (캔들 20개 이상) 가 안 되면 폴백 대상에서 제외.
-            # 폴백 판단은 MA20 게이트로 한정 (사용자 확정).
-            ma20 = trade_ws.get_ma20(sym)
-            last_price = RealMarketData.get_current_price(sym)
-            if ma20 is None:
-                tried.append((sym, False, f'캔들 부족 ({trade_ws.get_buffer_size(sym)}/20)'))
+            allowed, info = RealMarketData.check_tick_ma_gate(sym)
+            ma_tick = info.get('ma_tick')
+            ma_min = info.get('ma_min')
+            hybrid = info.get('hybrid') or info.get('ma60')
+            last_price = info.get('last_price')
+            if ma_tick is None:
+                tried.append(
+                    (sym, False,
+                     f'틱캔들 부족 ({info.get("candle_count", 0)}/{need})'))
+                continue
+            if ma_min is None:
+                tried.append(
+                    (sym, False,
+                     f'1분캔들 부족 ({info.get("min_candle_count", 0)}/'
+                     f'{getattr(minute_ma_cache, "PERIOD", 60) if minute_ma_cache else 60})'))
                 continue
             if last_price is None:
                 tried.append((sym, False, '현재가 조회 실패'))
                 continue
-            if last_price < ma20:
-                tried.append((sym, True, f'now < MA20 ({last_price:.4f} < {ma20:.4f})'))
+            if allowed:
+                tried.append(
+                    (sym, True,
+                     f'now < HybridMA ({last_price:.4f} < {hybrid:.4f} '
+                     f'tick={ma_tick:.4f} min={ma_min:.4f})'))
                 return sym, tried
-            else:
-                tried.append((sym, False, f'now ≥ MA20 ({last_price:.4f} ≥ {ma20:.4f})'))
+            tried.append(
+                (sym, False,
+                 f'now ≥ HybridMA/min ({last_price:.4f} hybrid={hybrid:.4f} '
+                 f'min={ma_min:.4f})'))
 
         # 전원 폴백 불가 — 첫 심볼을 반환하고 매수 게이트는 메인 루프에서 대기 처리.
-        # (아무 것도 반환하지 않으면 거래 자체가 멈추므로, 첫 심볼을 반환하여
-        #  기존처럼 MA20이 내려올 때까지 대기하도록 함)
         if symbols:
             return symbols[0], tried
         return None, tried
@@ -3498,6 +3983,56 @@ class OrderCanceler:
 
     BATCH_CANCEL_IDS_MAX = 20
     BATCH_QUERY_IDS_MAX = 100
+
+    def cancel_buy_orders_for_symbol(self, symbol, extra_uuids=None, verify=True):
+        """해당 심볼 미체결 bid만 취소 — 병렬 워커가 타 코인 매수를 지우지 않게.
+        buy_uuids 전역 clear 금지(다른 워커 UUID 보존)."""
+        global buy_uuids
+        if not symbol:
+            return
+        market = f"KRW-{symbol}"
+        targets = set(u for u in (extra_uuids or []) if u)
+        # 로컬 추적 중 해당 심볼로 추정 불가 → open list로 보강
+        try:
+            open_bids = self.list_open_bid_orders(market=market) or []
+            for o in open_bids:
+                uid = order_id_of(o)
+                if uid:
+                    targets.add(uid)
+        except Exception:
+            pass
+        # buy_uuids 중 open에 있는 것만 교집합으로 추가 시도는 open list로 충분
+        if targets:
+            self.cancel_orders_parallel(list(targets))
+        n = self.cancel_open_orders(cancel_side='bid', pairs=market)
+        if n is None or n < 0:
+            # batch open 미지원 — UUID만
+            pass
+        if verify:
+            try:
+                rem = self.list_open_bid_orders(market=market) or []
+                rem_uids = [order_id_of(o) for o in rem if order_id_of(o)]
+                if rem_uids:
+                    self.cancel_orders_parallel(rem_uids)
+                    for u in rem_uids:
+                        self.cancel_order(u)
+            except Exception as e:
+                print_log(LogLevel.WARNING,
+                          f"cancel_buy_orders_for_symbol verify: {str(e)[:80]}")
+        # 전역 set에서 이 심볼 관련 UUID만 제거
+        if targets:
+            for u in targets:
+                buy_uuids.discard(u)
+        try:
+            rem2 = self.list_open_bid_orders(market=market) or []
+            for o in rem2:
+                uid = order_id_of(o)
+                if uid:
+                    buy_uuids.discard(uid)
+        except Exception:
+            pass
+        print_log(LogLevel.INFO,
+                  f"매수 취소(심볼={symbol}) targets={len(targets)}")
 
     def cancel_buy_orders(self, extra_uuids=None, verify=True):
         """잔여 매수 전량 취소 — UUID 일괄 → open 일괄 → (verify) 잔여 검증 재스윕.
@@ -3957,7 +4492,9 @@ class OrderCanceler:
         headers['Content-Type'] = 'application/json'
         try:
             order_rate_limiter.note_use('cancel_and_new')
-            if not order_rate_limiter.acquire(timeout=0.35):
+            wid = get_current_worker_id()
+            wait = 3.0 if wid else 0.35
+            if not order_rate_limiter.acquire(timeout=wait, worker_id=wid):
                 order_rate_limiter._log_exhaustion('acquire-fail:cancel_and_new')
                 return None
 
@@ -4268,14 +4805,23 @@ class DynamicBuyOrder:
         
         # 상태 관리
         self.is_active = False
+        self._cycle_ended = False  # 사이클 종료 후 BuyModule 재개/재POST 금지
         self.last_order_time = None
         self.last_check_time = None
         self.first_order_start_time = None
-        self.first_order_timeout = 3.0  # 3초 미체결 시 취소 후 즉시체결가로 재호가
-        self._l1_requote_count = 0
-        # 재호가 횟수 제한 폐기 — 한도 후 return True가 무한대기의 원인이었음
-        self._l1_requote_max = 10**9
+        self.first_order_timeout = 3.0  # 첫주문 3초 미체결 → 취소+사이클중단 (고전)
+        self._first_order_timed_out = False
         self.executed_count = 0  # 체결된 레벨 수 — O(1) 완료 체크용
+        self._ma_gate_paused = False
+        self._skip_ma_gate = False  # True=매도/체결 진행중 → MA60 진입게이트 무시
+        self._skip_adopt_until = 0.0
+        self._skip_place_until = 0.0  # CAP/취소 lag 직후 재POST 금지
+        self._timeout_place_floor = None
+        self._last_buy_px_key = ''
+        self._same_px_requote_streak = 0
+        self._blocked_buy_px_keys = set()
+        self._buys_halted = False
+        self._buys_halted_by_topn = False
         
         # 계획 관리
         self.original_planned_orders = []
@@ -4299,7 +4845,7 @@ class DynamicBuyOrder:
         # 매수 체결 → 로컬 VWAP 즉시 매도 후 REST 교정
         self.on_buy_fill_sell = None  # callback(avg, total_vol)
 
-        # 밀림 관리
+        # 밀림 관리 — 워커별 동적 슬라이딩 (단일스레드 규칙 계승)
         self.plan_shift_amount = 0.0
         self.last_shift_check_price = current_price
 
@@ -4310,6 +4856,8 @@ class DynamicBuyOrder:
         
         # OrderCanceler 인스턴스
         self.order_canceler = OrderCanceler()
+        # 분할 POST 동시 진입 방지 — 워커당 정확히 최대 3개만
+        self._buy_place_lock = threading.RLock()
 
     def _notify_sell_after_buy_fill(self, fill_volume=0.0, fill_price=0.0,
                                      fill_uuid=None):
@@ -4339,7 +4887,8 @@ class DynamicBuyOrder:
             private_ws.arm_avg_sell(
                 vol_hint=float(fill_volume or 0),
                 fill_price=fp,
-                fill_uuid=fill_uuid)
+                fill_uuid=fill_uuid,
+                symbol=self.symbol)
             return
         except Exception:
             pass
@@ -4424,7 +4973,18 @@ class DynamicBuyOrder:
         self.last_executed_price = 0.0
 
     def _add_pending(self, pending):
-        """pending 등록 — list + O(1) 인덱스 동기화."""
+        """pending 등록 — list + O(1) 인덱스 동기화.
+        3개까지 허용. 4개째는 조용히 취소(로그 없음)."""
+        if len(self.pending_orders) >= MAX_OPEN_BUYS_PER_WORKER:
+            uid = pending.get('uuid') if isinstance(pending, dict) else None
+            if uid:
+                try:
+                    self.order_canceler.cancel_order(uid)
+                    buy_uuids.discard(uid)
+                except Exception:
+                    pass
+            self._last_buy_error = 'max_open_buys'
+            return False
         self.pending_orders.append(pending)
         uid = pending.get('uuid')
         if uid:
@@ -4435,9 +4995,153 @@ class DynamicBuyOrder:
         self.pending_levels.add(lv)
         self.pending_level_counts[lv] = self.pending_level_counts.get(lv, 0) + 1
         self.pending_split_keys.add((lv, pending.get('split_idx', 0)))
+        return True
+
+    def _local_open_buy_count(self):
+        return len(self.pending_orders or [])
+
+    def _exchange_open_buy_count(self):
+        """거래소 해당 심볼 open bid 수 — 150ms 캐시 (분할 POST 버스트당 1회)."""
+        now = time.time()
+        cache = getattr(self, '_ex_bid_cache', None)
+        if cache and (now - float(cache[0])) < 0.15:
+            return int(cache[1])
+        try:
+            bids = OrderCanceler().list_open_bid_orders(
+                market=f"KRW-{self.symbol}")
+            n = len(bids or [])
+        except Exception:
+            n = -1  # 조회 실패 = 보수적으로 차단하지 않되 슬롯에서 구분
+        self._ex_bid_cache = (now, n)
+        return n
+
+    def _invalidate_ex_bid_cache(self):
+        self._ex_bid_cache = None
+
+    def _hard_open_buy_count(self, *, check_exchange=True):
+        """★ 실제 미체결 매수 = max(로컬, 거래소).
+        check_exchange=False면 로컬만 (분할 POST 사이 REST 제거)."""
+        local = self._local_open_buy_count()
+        if not check_exchange:
+            return local
+        try:
+            ex = self._exchange_open_buy_count()
+        except Exception:
+            ex = -1
+        if ex < 0:
+            return local
+        return max(local, int(ex))
+
+    def _open_buy_slots_left(self, check_exchange=True):
+        """남은 POST 가능 수. ★ 거래소 포함 hard count 기준.
+        이미 3개면 0 → 4번째 FAIL."""
+        used = self._hard_open_buy_count(check_exchange=check_exchange)
+        if check_exchange and used > MAX_OPEN_BUYS_PER_WORKER:
+            try:
+                self._enforce_max_open_buys()
+            except Exception:
+                pass
+            used = self._hard_open_buy_count(check_exchange=True)
+        return max(0, int(MAX_OPEN_BUYS_PER_WORKER) - int(used))
+
+    def _buy_cap_full(self, where=''):
+        """미체결 3개 꽉 참 — 정상 대기. 로그 없음(CAP FAIL 제거)."""
+        self._last_buy_error = 'max_open_buys'
+        return True
+
+    # 하위 호환 — 예전 호출부
+    def _buy_cap_fail(self, where=''):
+        return self._buy_cap_full(where)
+
+    def _enforce_max_open_buys(self):
+        """미체결 매수가 3 초과(4+)일 때만 초과분 취소. 3개까지는 정상.
+        초과분 취소만 하고 절대 여기서 재POST하지 않음."""
+        # 로컬 먼저
+        while len(self.pending_orders) > MAX_OPEN_BUYS_PER_WORKER:
+            p = self.pending_orders[-1]
+            uid = p.get('uuid')
+            print_log(LogLevel.ERROR,
+                      f"BUY CAP ENFORCE: local "
+                      f"{len(self.pending_orders)}>{MAX_OPEN_BUYS_PER_WORKER} "
+                      f"{self.symbol} — cancel 초과 {(uid or '')[:8]}")
+            if uid:
+                try:
+                    self.order_canceler.cancel_order(uid)
+                except Exception:
+                    pass
+                buy_uuids.discard(uid)
+                self._remove_pendings_by_uuids({uid})
+            else:
+                try:
+                    self._pop_pending_at(len(self.pending_orders) - 1)
+                except Exception:
+                    break
+        # 거래소 4개 이상만 정리
+        try:
+            bids = OrderCanceler().list_open_bid_orders(
+                market=f"KRW-{self.symbol}") or []
+        except Exception:
+            bids = []
+        if len(bids) <= MAX_OPEN_BUYS_PER_WORKER:
+            return self._hard_open_buy_count() <= MAX_OPEN_BUYS_PER_WORKER
+
+        our = set()
+        if isinstance(self.pending_by_uuid, dict):
+            our = set(self.pending_by_uuid.keys())
+        orphans = []
+        ours_orders = []
+        for o in bids:
+            uid = order_id_of(o)
+            if not uid:
+                continue
+            if uid in our:
+                ours_orders.append(o)
+            else:
+                orphans.append(o)
+        cancel_uids = []
+        need = len(bids) - MAX_OPEN_BUYS_PER_WORKER
+        for o in orphans:
+            if need <= 0:
+                break
+            uid = order_id_of(o)
+            if uid:
+                cancel_uids.append(uid)
+                need -= 1
+        if need > 0 and ours_orders:
+            def _px(o):
+                try:
+                    return float(o.get('price') or o.get('p') or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            for o in sorted(ours_orders, key=_px):
+                if need <= 0:
+                    break
+                uid = order_id_of(o)
+                if uid:
+                    cancel_uids.append(uid)
+                    need -= 1
+        if cancel_uids:
+            print_log(LogLevel.ERROR,
+                      f"BUY CAP ENFORCE: exchange "
+                      f"{len(bids)}>{MAX_OPEN_BUYS_PER_WORKER} "
+                      f"{self.symbol} — cancel 초과 {len(cancel_uids)}건 "
+                      f"(재POST 없음)")
+            try:
+                self.order_canceler.cancel_orders_parallel(cancel_uids)
+            except Exception:
+                pass
+            buy_uuids.difference_update(cancel_uids)
+            self._remove_pendings_by_uuids(set(cancel_uids))
+            self._skip_place_until = max(
+                float(getattr(self, '_skip_place_until', 0) or 0),
+                time.time() + 1.5)
+        return self._hard_open_buy_count() <= MAX_OPEN_BUYS_PER_WORKER
 
     def _pop_pending_at(self, index):
-        """pending_orders[index] 제거 + 인덱스 갱신. 반환: pending dict."""
+        """pending_orders[index] 제거 + 인덱스 갱신. 반환: pending dict.
+        범위 밖이면 None (동시 수정 대비)."""
+        if index < 0 or index >= len(self.pending_orders):
+            return None
         pending = self.pending_orders.pop(index)
         uid = pending.get('uuid')
         if uid:
@@ -4452,6 +5156,17 @@ class DynamicBuyOrder:
         else:
             self.pending_level_counts[lv] = cnt
         return pending
+
+    def _pop_pending_by_uuid(self, order_uuid):
+        """uuid로 pending 제거. 없으면 None. 동시 clear/pop에도 안전."""
+        if not order_uuid:
+            return None
+        # pending_by_uuid에 없어도 리스트에 잔류할 수 있어 선형 탐색
+        for i, p in enumerate(self.pending_orders):
+            if p.get('uuid') == order_uuid:
+                return self._pop_pending_at(i)
+        self.pending_by_uuid.pop(order_uuid, None)
+        return None
 
     def _remove_pendings_by_uuids(self, uuid_set):
         """uuid 집합에 해당하는 pending 일괄 제거 O(P)."""
@@ -4527,6 +5242,71 @@ class DynamicBuyOrder:
         self.original_planned_orders = [order.copy() for order in self.active_planned_orders]
         self._rebuild_planned_index()
         print_log(LogLevel.SUCCESS, f"Calculated {len(self.active_planned_orders)} buy orders for {self.symbol} based on low price {self.low_price:.4f}")
+
+    def ensure_assist_level(self):
+        """집중모드(L6+) — 타코인 매도금을 받을 제8라운드(drop_count+1) 편입.
+        L8 drop_percentage = drop_count (예: drop_count=7 → 7% 하락 from L7 분할최저가).
+        초기 예산은 L1~L7에 이미 배분됨 — L8은 최소금액 placeholder,
+        실제 투입액은 마지막 레벨 전액흡수(타코인 매도 KRW)로 채움."""
+        dc = int(getattr(self, '_drop_count', 0) or 0)
+        if dc <= 0:
+            return False
+        assist_lv = dc + 1  # 7+1 = 8
+        plans = self.active_planned_orders
+        if not plans:
+            return False
+        if any(int(o.get('level') or 0) == assist_lv for o in plans):
+            return False
+        if getattr(self, '_cycle_ended', False) or getattr(self, '_buys_halted', False):
+            return False
+
+        prev = plans[-1]
+        prev_px = float(prev.get('planned_price') or 0)
+        if prev_px <= 0:
+            return False
+        prev_lv = int(prev.get('level') or dc)
+        # drop_percentage ≡ drop_count (round_down의 proportion = %)
+        drop_prop = float(dc)
+        prev_splits = UpbitTickSystem.generate_split_prices(
+            prev_px, split_count_for_level(prev_lv), SPLIT_STEP_PERCENT)
+        base = min(prev_splits) if prev_splits else prev_px
+        new_price = UpbitTickSystem.round_down(base, drop_prop)
+        tick = UpbitTickSystem.get_minimum_tick(prev_px)
+        if new_price >= prev_px:
+            new_price = UpbitTickSystem.snap_to_tick(prev_px - tick, 'floor')
+        if new_price <= 0:
+            return False
+
+        qty = float(MIN_ORDER_AMOUNT)
+        vol = UpbitTickSystem.volume_for_krw(new_price, qty)
+        if vol <= 0:
+            return False
+
+        plans.append({
+            'level': assist_lv,
+            'original_planned_price': new_price,
+            'planned_price': new_price,
+            'quantity': qty,
+            'volume': vol,
+            'executed': False,
+            'shift_applied': 0.0,
+            'assist': True,
+        })
+        # original 백업에도 반영 (상태/재개용)
+        try:
+            self.original_planned_orders.append(plans[-1].copy())
+        except Exception:
+            pass
+        self._rebuild_planned_index()
+        # L7까지 끝났어도 L8 대기 — 매수 재개
+        if not getattr(self, '_cycle_ended', False):
+            self.is_active = True
+        print_log(
+            LogLevel.WARNING,
+            f"L{assist_lv} assist 편입 {self.symbol}: "
+            f"px={new_price:.8f} (L{prev_lv}@{prev_px:.8f} → drop%{drop_prop:g}=drop_count) "
+            f"— 타코인 매도 KRW → L{assist_lv}")
+        return True
 
     def _finalize_krw_budgets(self):
         """가중 분배 결과를 정수 KRW 예산으로 고정. 합계 == floor(total_amount).
@@ -4903,6 +5683,9 @@ class DynamicBuyOrder:
         self._last_replace_retry = 0.0
         self._last_fill_rest_check = 0.0
         self.last_shift_check_price = self.current_price
+        self._first_order_timed_out = False
+        self._buys_halted = False
+        self._cycle_ended = False
 
         if skip_level1:
             self.skip_level1_for_resume(self.current_price)
@@ -4923,29 +5706,39 @@ class DynamicBuyOrder:
         return ok
 
     def check_and_continue(self, cached_price=None):
-        """체결 확인 및 다음 주문 실행 — 초저지연 (게이트 없이 최대 속도).
-        cached_price: 호출자가 이미 구한 현재가를 전달 (중복 조회 방지)."""
+        """체결 확인 + 동적 밀림 + 다음 주문.
+        단일스레드 규칙을 워커마다 계승:
+          1) 가격하락 → plan_shift
+          2) 첫주문 3초 미체결(체결 0) → 취소 + is_active=False (재호가 추격 없음)
+          3) 체결/빈 pending → 다음 레벨 POST
+        """
+        if getattr(self, '_cycle_ended', False):
+            return False
         if not self.is_active:
             return False
 
-        # 현재가 — 호출자 캐시 우선 (매 iteration 중복 조회 방지)
         current_price = cached_price if cached_price else RealMarketData.get_current_price(self.symbol)
         if not current_price:
             return False
-
+        clean, bad = RealMarketData.sanitize_symbol_price(
+            self.symbol, current_price)
+        if bad and clean:
+            current_price = clean
+        elif bad:
+            current_price = RealMarketData.get_current_price(self.symbol)
+            if not current_price:
+                return False
         self.current_price = current_price
 
-        # 계획 밀림 확인 (현재가 기준)
+        # ★ 워커별 동적 슬라이딩 — 고전: 타임아웃보다 먼저
         self._check_and_apply_plan_shift(current_price)
 
-        # 첫 주문(레벨) 타임아웃 — 3초 미체결이면 취소 후 즉시체결가 재호가
-        if self._should_timeout_requote_pending():
-            return self._force_timeout_requote(current_price)
+        # ★ 고전 첫주문 타임아웃: 체결 0 + pending → 취소·중단 (재호가 금지)
+        if self._should_first_order_timeout():
+            return self._classic_first_order_timeout()
 
-        # 체결 확인
         has_new_execution = self._check_order_execution()
 
-        # 분할 대기 로그 — 레벨당 1회만 (filled/pending 변동 무시)
         if self.partial_levels and self.pending_orders:
             lv = min(self.partial_levels)
             logged = getattr(self, '_partial_wait_logged_levels', None)
@@ -4960,7 +5753,7 @@ class DynamicBuyOrder:
                           f"Level {lv} waiting splits: filled={filled}, "
                           f"pending={pend_n} — next level held")
 
-        # 체결되었거나 대기 주문이 없으면 다음 주문 실행
+        # pending 없어도 partial/실패큐 처리 후 다음 레벨 진행
         if has_new_execution or len(self.pending_orders) == 0:
             return self._execute_next_available_order()
 
@@ -4983,19 +5776,18 @@ class DynamicBuyOrder:
         protected_levels = self.pending_levels | self.partial_levels
 
         orders_to_cancel = []
-        # 역순 인덱스 — 체결 처리 시 pop 해도 안전
-        for i in range(len(self.pending_orders) - 1, -1, -1):
-            pending_order = self.pending_orders[i]
+        # uuid 스냅샷 — 체결 pop/동시 수정에도 안전
+        for pending_order in list(self.pending_orders):
             if pending_order['level'] in protected_levels:
                 continue
             order_uuid = pending_order.get('uuid')
-            if not order_uuid:
+            if not order_uuid or order_uuid not in self.pending_by_uuid:
                 continue
             order_info = self._get_order_info(order_uuid, force_rest=False)
             if not order_info:
                 continue
             if self._order_is_filled(order_info):
-                self._process_executed_order(pending_order, i, order_info)
+                self._process_executed_order(pending_order, None, order_info)
                 continue
             state = str(order_info.get('state', '')).lower()
             if state != 'cancel':
@@ -5107,6 +5899,133 @@ class DynamicBuyOrder:
         fillable = UpbitTickSystem.round_up(live + pad)
         return max(planned_price, fillable)
 
+    def _px_key(self, price):
+        """호가 비교용 키 — 동일 틱이면 동일 문자열."""
+        try:
+            p = float(price or 0)
+        except (TypeError, ValueError):
+            return ''
+        if p <= 0:
+            return ''
+        return UpbitTickSystem.format_order_price(
+            UpbitTickSystem.snap_to_tick(p))
+
+    def _holdings_avg_px(self):
+        """현재 보유 평단 (WS). 없으면 0."""
+        try:
+            if private_ws._is_initialized and private_ws.is_connected:
+                bal, locked, avg = private_ws.get_symbol_info(self.symbol)
+                if (bal + locked) >= MIN_HOLDING_VOLUME and avg and avg > 0:
+                    return float(avg)
+        except Exception:
+            pass
+        return 0.0
+
+    def _is_forbidden_buy_price(self, price):
+        """동일 워커에서 절대 걸면 안 되는 매수가.
+        - 이미 pending인 호가
+        - 현재 보유 평단과 동일 틱
+        - 직전 체결가와 동일 틱
+        - 타임아웃으로 막힌 호가"""
+        key = self._px_key(price)
+        if not key:
+            return True, 'invalid'
+        for p in (self.pending_orders or []):
+            if self._px_key(p.get('actual_price') or p.get('planned_price')) == key:
+                return True, 'pending-same'
+        avg = self._holdings_avg_px()
+        if avg > 0 and self._px_key(avg) == key:
+            return True, 'same-avg'
+        if key in (self._blocked_buy_px_keys or set()):
+            return True, 'blocked'
+        le = float(getattr(self, 'last_executed_price', 0) or 0)
+        if le > 0 and self._px_key(le) == key:
+            return True, 'last-fill-same'
+        return False, ''
+
+    def _prune_blocked_buy_px(self, live_price):
+        """시세에서 멀리 떨어진 금지호가 정리 — 무한 하향 chase 방지."""
+        if not self._blocked_buy_px_keys or not live_price or live_price <= 0:
+            return
+        keep = set()
+        for k in list(self._blocked_buy_px_keys):
+            try:
+                pk = float(k)
+            except (TypeError, ValueError):
+                continue
+            # live ±3% 안만 유지 (너무 먼 금지는 폐기)
+            if abs(pk - live_price) / live_price <= 0.03:
+                keep.add(k)
+        self._blocked_buy_px_keys = keep
+
+    def _next_distinct_buy_price(self, preferred, prefer_down=True, floor=None, ceiling=None):
+        """preferred와 금지호가를 피해 최소 1틱 이상 다른 매수가.
+        floor/ceiling으로 시세 이탈 하한·상한 제한."""
+        try:
+            px = float(preferred or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px <= 0:
+            px = float(self.current_price or 0) or 0.0
+        if px <= 0:
+            return 0.0
+        cursor = UpbitTickSystem.snap_to_tick(px)
+        for i in range(40):
+            bad, _why = self._is_forbidden_buy_price(cursor)
+            if not bad:
+                if floor is not None and cursor + 1e-15 < float(floor):
+                    pass
+                elif ceiling is not None and cursor > float(ceiling) + 1e-15:
+                    pass
+                else:
+                    return cursor
+            tick = UpbitTickSystem.get_minimum_tick(cursor)
+            step = tick * max(1, (i // 2) + 1)
+            if prefer_down:
+                nxt = UpbitTickSystem.snap_to_tick(cursor - step, 'floor')
+                if floor is not None and nxt + 1e-15 < float(floor):
+                    # 하한 도달 — 위로 전환
+                    prefer_down = False
+                    cursor = UpbitTickSystem.snap_to_tick(
+                        max(cursor, float(floor)) + tick, 'ceil')
+                    continue
+                cursor = nxt
+            else:
+                nxt = UpbitTickSystem.snap_to_tick(cursor + step, 'ceil')
+                if ceiling is not None and nxt > float(ceiling) + 1e-15:
+                    break
+                cursor = nxt
+            if cursor <= 0:
+                break
+        return 0.0
+
+    def _wait_exchange_bids_cleared(self, timeout=1.0):
+        """타임아웃 취소 후 거래소 bid가  lag로 남는 동안 재POST 금지."""
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            try:
+                n = int(self._exchange_open_buy_count() or 0)
+            except Exception:
+                n = 0
+            if n <= 0:
+                return True
+            time.sleep(0.05)
+        try:
+            return int(self._exchange_open_buy_count() or 0) <= 0
+        except Exception:
+            return False
+
+    def _clear_pending_tracking_only(self):
+        """pending 추적만 비움 — executed/plan/next_plan_idx 유지."""
+        self.pending_orders.clear()
+        if isinstance(self.pending_by_uuid, dict):
+            self.pending_by_uuid.clear()
+        else:
+            self.pending_by_uuid = {}
+        self.pending_levels.clear()
+        self.pending_level_counts.clear()
+        self.pending_split_keys.clear()
+
     def _pending_unfilled_age(self):
         """미체결 pending 중 가장 오래된 주문 경과초. 없으면 0."""
         if not self.pending_orders:
@@ -5141,55 +6060,105 @@ class DynamicBuyOrder:
                 pass
         return False
 
-    def _should_timeout_requote_pending(self):
-        """L1(또는 현재 첫 미체결 레벨) 미체결 타임아웃 재호가 대상인지."""
-        if not self.is_active or not self.pending_orders:
+    def _should_first_order_timeout(self):
+        """고전: 체결 0 + pending + first_order_timeout 초과."""
+        if getattr(self, '_cycle_ended', False):
             return False
-        # 레벨 완료 전 체결분이 있으면 분할 대기 — 전량취소 금지
-        if self.executed_count > 0:
+        if getattr(self, '_ma_gate_paused', False):
             return False
-        if self._has_any_level_fill():
+        if not self.first_order_start_time:
+            return False
+        if not self.pending_orders:
+            return False
+        # 체결(레벨완료·부분)이 있으면 타임아웃 중단 안 함 — plan_shift/사다리 유지
+        if self.executed_count > 0 or self._has_any_level_fill():
             return False
         age = self._pending_unfilled_age()
         if age <= 0:
-            if self.first_order_start_time:
-                age = time.time() - float(self.first_order_start_time)
-            else:
-                return False
-        return age > float(self.first_order_timeout)
+            age = time.time() - float(self.first_order_start_time)
+        return age > float(self.first_order_timeout or 3.0)
+
+    def _classic_first_order_timeout(self):
+        """고전 첫주문 타임아웃: 미체결 취소 + is_active=False. 재호가 추격 없음."""
+        age = self._pending_unfilled_age()
+        if age <= 0 and self.first_order_start_time:
+            age = time.time() - float(self.first_order_start_time)
+        print_log(LogLevel.WARNING,
+                  f"First order timeout after {age:.0f} seconds")
+        try:
+            self._cancel_pending_sync()
+        except Exception:
+            pass
+        try:
+            OrderCanceler().cancel_buy_orders_for_symbol(
+                self.symbol, verify=False)
+        except Exception:
+            pass
+        self._clear_pending_tracking_only()
+        self._failed_replaces = []
+        self.is_active = False
+        self._first_order_timed_out = True
+        return False
+
+    def _should_timeout_requote_pending(self):
+        """호환 alias → 고전 첫주문 타임아웃."""
+        return self._should_first_order_timeout()
 
     def _force_timeout_requote(self, live_price=None):
-        """워치독/핫패스 공용 — 미체결 pending 취소 후 즉시체결가 재배치."""
-        if not self._should_timeout_requote_pending():
+        """호환 alias → 고전 취소+중단 (상향재호가 제거)."""
+        if not self._should_first_order_timeout():
             return False
-        px = live_price or self.current_price or RealMarketData.get_current_price(self.symbol)
-        age = self._pending_unfilled_age()
-        self._l1_requote_count += 1
-        print_log(LogLevel.WARNING,
-                  f"fill-timeout requote after {age:.1f}s "
-                  f"(#{self._l1_requote_count}, pending={len(self.pending_orders)})")
-        self._last_fill_rest_check = 0.0
-        if self._check_order_execution():
-            return True
-        if not self._should_timeout_requote_pending():
-            return True
-        n_pending = len(self.pending_orders)
-        if n_pending <= 1 and px and self._requote_via_cancel_and_new(px):
-            self.first_order_start_time = time.time()
-            return True
-        self._cancel_pending_sync()
-        if px:
-            self._requote_first_buy(px)
-        self.first_order_start_time = time.time()
-        self.is_active = True
-        return bool(self._execute_next_available_order())
+        return self._classic_first_order_timeout()
 
     def _execute_next_available_order(self):
         """다음 실행 가능한 주문 실행 — cursor + O(1) 세트 조회."""
         if not self.is_active:
             return False
+        if not self._buys_allowed():
+            return False
 
         if self.pending_orders:
+            return False
+
+        if time.time() < float(getattr(self, '_skip_place_until', 0) or 0):
+            return False
+
+        # 타임아웃 취소 직후엔 옛 bid 재흡수 금지 (재호가 무력화 버그)
+        if time.time() < float(getattr(self, '_skip_adopt_until', 0) or 0):
+            pass
+        else:
+            try:
+                if self._adopt_exchange_bids_if_any():
+                    return False
+            except Exception:
+                pass
+
+        # 로컬 pending 없는데 거래소 bid 잔존 → 재POST 금지 (CAP 루프)
+        try:
+            ex_n = int(self._exchange_open_buy_count() or 0)
+        except Exception:
+            ex_n = 0
+        if ex_n > 0 and not self.pending_orders:
+            if time.time() < float(getattr(self, '_skip_adopt_until', 0) or 0):
+                return False
+            try:
+                if self._adopt_exchange_bids_if_any():
+                    return False
+            except Exception:
+                pass
+            try:
+                OrderCanceler().cancel_buy_orders_for_symbol(
+                    self.symbol, verify=False)
+            except Exception:
+                pass
+            self._skip_place_until = time.time() + 1.0
+            print_log(LogLevel.WARNING,
+                      f"{self.symbol}: 거래소 bid {ex_n}건 잔존 "
+                      f"— 정리 후 재POST 보류")
+            return False
+
+        # ★ 워커당 미체결 매수 3개 꽉 참 → 다음 레벨 대기(정상). 로그 없음.
+        if self._open_buy_slots_left(check_exchange=True) <= 0:
             return False
 
         # 분할 POST 실패 재주문 큐가 있으면 전체 레벨 재주문 금지 (중복 주문 방지)
@@ -5230,7 +6199,8 @@ class DynamicBuyOrder:
     def _execute_single_order(self, order):
         """주문 실행 — 전 라운드 삼중매수.
         각 주문 금액이 MIN_ORDER_AMOUNT 미만이면 분할 금지하고 단일 폴백.
-        마지막 레벨은 잔여 KRW 전액 흡수 후 동일하게 삼중 분할."""
+        마지막 레벨은 잔여 KRW 전액 흡수 후 동일하게 삼중 분할.
+        ★ 워커당 미체결 매수 3개까지 허용, 4개부터 금지."""
         level = order.get('level')
         if order.get('executed') or self._is_level_executed(level):
             print_log(LogLevel.WARNING,
@@ -5245,6 +6215,11 @@ class DynamicBuyOrder:
         if level in self.pending_levels:
             print_log(LogLevel.WARNING,
                       f"Order {level} still pending — skip duplicate place")
+            return False
+
+        # 거래소+로컬 hard 기준 — 슬롯 0이면 대기
+        slots = self._open_buy_slots_left(check_exchange=True)
+        if slots <= 0:
             return False
 
         order_price = order['planned_price']
@@ -5307,19 +6282,55 @@ class DynamicBuyOrder:
             return False
 
         n_want = split_count_for_level(order['level'])
-        raw_prices = UpbitTickSystem.generate_split_prices(
-            order_price, n_want, SPLIT_STEP_PERCENT)
-
-        # 동일 호가 병합 (문자열 키)
+        # 틱 사다리로 생성 — format 키가 겹치지 않게 보장
+        raw_prices = UpbitTickSystem._tick_ladder_prices(order_price, n_want)
+        if len(raw_prices) < n_want:
+            raw_prices = UpbitTickSystem.generate_split_prices(
+                order_price, n_want, SPLIT_STEP_PERCENT)
         split_prices = []
         seen = set()
-        for sp in raw_prices:
+        for sp in (raw_prices or [order_price]):
+            sp = UpbitTickSystem.snap_to_tick(sp)
             key = UpbitTickSystem.format_order_price(sp)
+            if not key or key in seen:
+                # 겹치면 1틱 아래 재시도
+                tick = UpbitTickSystem.get_minimum_tick(sp if sp > 0 else order_price)
+                for _ in range(8):
+                    sp = UpbitTickSystem.snap_to_tick(sp - tick, 'floor')
+                    if sp <= 0:
+                        break
+                    key = UpbitTickSystem.format_order_price(sp)
+                    if key and key not in seen:
+                        break
+                else:
+                    continue
             if key in seen:
                 continue
             seen.add(key)
-            split_prices.append(UpbitTickSystem.snap_to_tick(sp))
+            split_prices.append(sp)
         n_splits = len(split_prices) or 1
+        if n_splits < n_want and n_want > 1:
+            # 부족분 틱 사다리 보충
+            cursor = split_prices[-1] if split_prices else UpbitTickSystem.snap_to_tick(order_price)
+            while len(split_prices) < n_want:
+                tick = UpbitTickSystem.get_minimum_tick(cursor)
+                cursor = UpbitTickSystem.snap_to_tick(cursor - tick, 'floor')
+                if cursor <= 0:
+                    break
+                key = UpbitTickSystem.format_order_price(cursor)
+                if key and key not in seen:
+                    seen.add(key)
+                    split_prices.append(cursor)
+            n_splits = len(split_prices) or 1
+
+        # ★ 슬롯 상한 — 남은 자리만큼만 분할 (절대 3 초과 계획 금지)
+        # ★ 슬롯이 줄어도 level_krw 전액을 재배분 (slice로 /n만 쓰는 버그 금지)
+        slots = self._open_buy_slots_left(check_exchange=True)
+        if slots <= 0:
+            return False
+        if n_splits > slots:
+            split_prices = split_prices[:slots]
+            n_splits = slots
 
         # 분할당 KRW가 최소주문 미만이면 단일 폴백
         if n_splits > 1 and (level_krw // n_splits) < MIN_ORDER_AMOUNT:
@@ -5376,35 +6387,37 @@ class DynamicBuyOrder:
                  f"vol={[round(v, 8) for v in split_volumes]} @ "
                  f"{[UpbitTickSystem.format_order_price(p) for p in split_prices]}")
 
-        # 삼중매수: sleep 없이 즉시 순차 POST (간격 sleep이 1초병목으로 보임)
+        # 삼중매수: 슬롯 재확인하며 순차 POST — 4번째 시도 자체를 안 함
+        # ★ 분할 사이는 로컬 카운트만 (거래소 open-bid GET 제거 → POST 연타)
         success_count = 0
         rate_hits = 0
-        for idx, sp in enumerate(split_prices):
-            order_uuid = self.place_dynamic_buy_order(
-                sp, split_volumes[idx], 'floor')
-            if order_uuid:
-                pending_order = {
-                    'level': order['level'],
-                    'planned_price': order['planned_price'],
-                    'actual_price': sp,
-                    'volume': split_volumes[idx],
-                    'krw_budget': split_krw[idx] if idx < len(split_krw) else 0,
-                    'order_time': time.time(),
-                    'uuid': order_uuid,
-                    'split_idx': idx,
-                    'split_total': n_splits,
-                }
-                self._add_pending(pending_order)
-                success_count += 1
-            else:
-                err = str(getattr(self, '_last_buy_error', '') or '').lower()
-                if 'rate_limit' in err or '429' in err:
-                    rate_hits += 1
-                    # sleep 없이 즉시 1회 재시도
-                    order_uuid = self.place_dynamic_buy_order(
-                        sp, split_volumes[idx], 'floor')
+        placed_krw = 0
+        first_unattempted = len(split_prices)  # 전부 시도했다고 가정
+        with self._buy_place_lock:
+            slots = self._open_buy_slots_left(check_exchange=True)
+            if slots <= 0:
+                return False
+            if n_splits > slots:
+                # ★ 전액 재배분 — split_krw[:slots] slice 금지 (전액/n만 사는 버그)
+                split_prices = split_prices[:slots]
+                n_splits = slots
+                if n_splits > 1 and (level_krw // n_splits) < MIN_ORDER_AMOUNT:
+                    split_prices = [UpbitTickSystem.snap_to_tick(order_price)]
+                    n_splits = 1
+                split_krw = self._allocate_split_krw(level_krw, n_splits)
+                split_volumes = [
+                    UpbitTickSystem.volume_for_krw(sp, k)
+                    for sp, k in zip(split_prices, split_krw)
+                ]
+            first_unattempted = len(split_prices)
+            for idx, sp in enumerate(split_prices):
+                if self._open_buy_slots_left(check_exchange=False) <= 0:
+                    first_unattempted = idx
+                    break
+                order_uuid = self.place_dynamic_buy_order(
+                    sp, split_volumes[idx], 'floor')
                 if order_uuid:
-                    self._add_pending({
+                    pending_order = {
                         'level': order['level'],
                         'planned_price': order['planned_price'],
                         'actual_price': sp,
@@ -5414,23 +6427,85 @@ class DynamicBuyOrder:
                         'uuid': order_uuid,
                         'split_idx': idx,
                         'split_total': n_splits,
-                    })
+                    }
+                    if not self._add_pending(pending_order):
+                        first_unattempted = idx + 1
+                        break
                     success_count += 1
+                    placed_krw += int(split_krw[idx] if idx < len(split_krw) else 0)
                 else:
-                    self._enqueue_failed_replace({
-                        'level': order['level'],
-                        'planned_price': order['planned_price'],
-                        'actual_price': sp,
-                        'volume': split_volumes[idx],
-                        'krw_budget': split_krw[idx] if idx < len(split_krw) else 0,
-                        'split_idx': idx,
-                        'split_total': n_splits,
-                    })
+                    err = str(getattr(self, '_last_buy_error', '') or '').lower()
+                    if 'max_open_buys' in err:
+                        first_unattempted = idx
+                        break
+                    if 'rate_limit' in err or '429' in err:
+                        rate_hits += 1
+                        if self._open_buy_slots_left(check_exchange=False) <= 0:
+                            first_unattempted = idx
+                            break
+                        order_uuid = self.place_dynamic_buy_order(
+                            sp, split_volumes[idx], 'floor')
+                    if order_uuid:
+                        if not self._add_pending({
+                            'level': order['level'],
+                            'planned_price': order['planned_price'],
+                            'actual_price': sp,
+                            'volume': split_volumes[idx],
+                            'krw_budget': split_krw[idx] if idx < len(split_krw) else 0,
+                            'order_time': time.time(),
+                            'uuid': order_uuid,
+                            'split_idx': idx,
+                            'split_total': n_splits,
+                        }):
+                            first_unattempted = idx + 1
+                            break
+                        success_count += 1
+                        placed_krw += int(split_krw[idx] if idx < len(split_krw) else 0)
+                    else:
+                        if 'max_open_buys' in str(
+                                getattr(self, '_last_buy_error', '') or '').lower():
+                            first_unattempted = idx
+                            break
+                        self._enqueue_failed_replace({
+                            'level': order['level'],
+                            'planned_price': order['planned_price'],
+                            'actual_price': sp,
+                            'volume': split_volumes[idx],
+                            'krw_budget': split_krw[idx] if idx < len(split_krw) else 0,
+                            'split_idx': idx,
+                            'split_total': n_splits,
+                        })
+
+            # ★ 미시도 슬롯 KRW는 1호가로 몰아 재시도 (slice/중도 break → /n만 사는 버그)
+            if first_unattempted < len(split_krw):
+                remain_krw = sum(int(k) for k in split_krw[first_unattempted:])
+                if remain_krw >= MIN_ORDER_AMOUNT:
+                    px = (split_prices[first_unattempted]
+                          if first_unattempted < len(split_prices)
+                          else UpbitTickSystem.snap_to_tick(order_price))
+                    vol = UpbitTickSystem.volume_for_krw(px, remain_krw)
+                    if vol > 0:
+                        self._enqueue_failed_replace({
+                            'level': order['level'],
+                            'planned_price': order['planned_price'],
+                            'actual_price': px,
+                            'volume': vol,
+                            'krw_budget': remain_krw,
+                            'split_idx': first_unattempted,
+                            'split_total': max(n_splits, 1),
+                        })
+                        print_log(LogLevel.WARNING,
+                                  f"Order {order['level']} remain KRW={remain_krw:,} "
+                                  f"queued (placed {success_count}/{n_splits}, "
+                                  f"spent={placed_krw:,}/{level_krw:,})")
 
         if success_count > 0:
             print_log(LogLevel.SUCCESS,
                       f"Order {order['level']} placed ({success_count}/{n_splits} splits)")
+            self._enforce_max_open_buys()
             return True
+        if 'max_open_buys' in str(getattr(self, '_last_buy_error', '') or '').lower():
+            return False
         if rate_hits >= n_splits:
             print_log(LogLevel.WARNING,
                       f"Order {order['level']} deferred — rate limit, queued for retry")
@@ -5496,7 +6571,17 @@ class DynamicBuyOrder:
         return newly_done
 
     def _replace_cancelled_split(self, cancelled_pending):
-        """취소/POST실패 분할만 같은 가격/수량으로 재주문 — 라운드 전체 분할 체결 조건 유지."""
+        """취소/POST실패 분할 재주문.
+        ★ 타임아웃 재호가 중이면 동일가 재POST 절대 금지."""
+        if getattr(self, '_timeout_requoting', False):
+            return
+        with self._buy_place_lock:
+            if self._open_buy_slots_left(check_exchange=True) <= 0:
+                return
+            self._replace_cancelled_split_locked(cancelled_pending)
+
+    def _replace_cancelled_split_locked(self, cancelled_pending):
+        """_replace_cancelled_split 본체 — place lock 보유 상태에서만 호출."""
         level = cancelled_pending['level']
         split_idx = cancelled_pending.get('split_idx', 0)
         if self._is_level_executed(level):
@@ -5510,12 +6595,25 @@ class DynamicBuyOrder:
         if not price or volume <= 0:
             self._enqueue_failed_replace(cancelled_pending)
             return
+        # 동일 평단/금지호가면 1틱 이상 아래로
+        bad, why = self._is_forbidden_buy_price(price)
+        if bad:
+            alt = self._next_distinct_buy_price(price, prefer_down=True)
+            if alt <= 0:
+                print_log(LogLevel.WARNING,
+                          f"Level {level} split re-place skipped "
+                          f"({why} @ {price})")
+                self._enqueue_failed_replace(cancelled_pending)
+                return
+            print_log(LogLevel.WARNING,
+                      f"Level {level} split re-place {price}→{alt} ({why})")
+            price = alt
         print_log(LogLevel.INFO,
                   f"Level {level} split {split_idx+1}/"
                   f"{cancelled_pending.get('split_total', '?')} — re-placing")
         order_uuid = self.place_dynamic_buy_order(price, volume, 'floor')
         if order_uuid:
-            self._add_pending({
+            if self._add_pending({
                 'level': level,
                 'planned_price': cancelled_pending.get('planned_price', price),
                 'actual_price': price,
@@ -5524,101 +6622,121 @@ class DynamicBuyOrder:
                 'uuid': order_uuid,
                 'split_idx': split_idx,
                 'split_total': cancelled_pending.get('split_total', 1),
-            })
-            self._dequeue_failed_replace(level, split_idx)
-        else:
-            self._enqueue_failed_replace(cancelled_pending)
-            print_log(LogLevel.ERROR,
-                      f"Failed to re-place split for level {level}")
+            }):
+                self._dequeue_failed_replace(level, split_idx)
+            return
+        err = str(getattr(self, '_last_buy_error', '') or '').lower()
+        if 'max_open_buys' in err:
+            return
+        self._enqueue_failed_replace(cancelled_pending)
+        print_log(LogLevel.ERROR,
+                  f"Failed to re-place split for level {level}")
 
     def _order_is_filled(self, order_info):
         """체결 여부 — 업비트/빗썸 필드 공통."""
         return order_is_filled(normalize_order(order_info) if order_info else None)
 
-    def _check_order_execution(self):
-        """주문 체결 확인 — Private WS 우선, REST는 스로틀된 안전망.
-        매 루프 force_rest는 429/풀고갈로 매수·매도 POST를 지연시킴."""
-        if not self.pending_orders:
-            return False
-
-        executed_any = False
-        now = time.time()
-
-        holding_hint = False
-        try:
-            if private_ws._is_initialized and private_ws.is_connected:
-                bal, locked, _ = private_ws.get_symbol_info(self.symbol)
-                holding_hint = (bal + locked) >= MIN_HOLDING_VOLUME
-        except Exception:
-            holding_hint = False
-
-        ws_healthy = private_ws._is_initialized and private_ws.is_connected
-        if holding_hint:
-            rest_interval = 0.08 if ws_healthy else 0.03
-        else:
-            rest_interval = 0.4 if ws_healthy else 0.12
-        force_rest = (now - getattr(self, '_last_fill_rest_check', 0)) >= rest_interval
-        if force_rest:
-            self._last_fill_rest_check = now
-            if EXCHANGE.get('supports_batch_query_ids') and len(self.pending_orders) > 1:
-                pending_uids = [p.get('uuid') for p in self.pending_orders if p.get('uuid')]
-                batched = OrderCanceler.fetch_orders_by_uuids(pending_uids)
-                if batched and private_ws._is_initialized:
-                    with private_ws._order_lock:
-                        private_ws.order_cache.update(batched)
-                    self._batch_rest_at = now
-
-        for i in range(len(self.pending_orders) - 1, -1, -1):
-            pending_order = self.pending_orders[i]
-            order_uuid = pending_order.get('uuid')
-            if not order_uuid:
-                continue
-
-            try:
-                order_info = self._get_order_info(order_uuid, force_rest=force_rest)
-                if not order_info:
-                    continue
-
-                state = str(order_info.get('state', '')).lower()
-
-                if self._order_is_filled(order_info):
-                    self._process_executed_order(pending_order, i, order_info)
-                    executed_any = True
-                elif state == 'cancel':
-                    cancelled = self._pop_pending_at(i)
-                    print_log(LogLevel.INFO,
-                              f"Order {cancelled['level']} split "
-                              f"{cancelled.get('split_idx', 0)+1} was cancelled")
-                    self._replace_cancelled_split(cancelled)
-
-            except Exception as e:
-                print_log(LogLevel.ERROR, f"Error checking order execution: {str(e)}")
-                continue
-
-        # 재주문 실패분 재시도 (전 분할 체결 조건 유지)
-        if self._failed_replaces:
-            now3 = time.time()
-            if now3 - getattr(self, '_last_replace_retry', 0) >= 0.05:
-                self._last_replace_retry = now3
-                # 스냅샷 — 재시도 중 큐가 갱신될 수 있음
-                for failed in list(self._failed_replaces):
-                    if not self._is_level_executed(failed['level']):
-                        self._replace_cancelled_split(failed)
-
-        # partial만 남고 재주문 큐도 없으면 레벨 완료로 해제 (다음 라운드 영구 차단 방지)
-        for lv in list(self.partial_levels):
+    def _unlock_stuck_partial_levels(self):
+        """pending/재주문 없이 partial만 남은 레벨 → 완료 처리해 다음 라운드 해제.
+        (MA취소 후 매도만 남는 고착 방지)"""
+        unlocked = False
+        for lv in list(self.partial_levels or []):
             if self._is_level_executed(lv):
                 self.partial_levels.discard(lv)
+                unlocked = True
                 continue
             if lv in self.pending_levels or self._has_failed_replace_for_level(lv):
                 continue
-            filled = self.level_fill_count.get(lv, 0)
+            filled = int(self.level_fill_count.get(lv, 0) or 0)
             if filled > 0:
                 print_log(LogLevel.WARNING,
                           f"Level {lv} stuck incomplete ({filled} fills, "
                           f"no pending/retry) — completing to unlock next round")
-                fallback = self.last_executed_price or getattr(self, 'current_price', 0) or 0
+                fallback = (self.last_executed_price
+                            or getattr(self, 'current_price', 0) or 0)
                 self._complete_level_from_fills(lv, fallback)
+                unlocked = True
+            else:
+                self.partial_levels.discard(lv)
+                unlocked = True
+        return unlocked
+
+    def _check_order_execution(self):
+        """주문 체결 확인 — Private WS 우선, REST는 스로틀된 안전망.
+        pending이 비어도 partial 고착 해제·실패재주문은 반드시 수행."""
+        executed_any = False
+        now = time.time()
+
+        if self.pending_orders:
+            holding_hint = False
+            try:
+                if private_ws._is_initialized and private_ws.is_connected:
+                    bal, locked, _ = private_ws.get_symbol_info(self.symbol)
+                    holding_hint = (bal + locked) >= MIN_HOLDING_VOLUME
+            except Exception:
+                holding_hint = False
+
+            ws_healthy = private_ws._is_initialized and private_ws.is_connected
+            if holding_hint:
+                rest_interval = 0.08 if ws_healthy else 0.03
+            else:
+                rest_interval = 0.4 if ws_healthy else 0.12
+            force_rest = (now - getattr(self, '_last_fill_rest_check', 0)) >= rest_interval
+            if force_rest:
+                self._last_fill_rest_check = now
+                if EXCHANGE.get('supports_batch_query_ids') and len(self.pending_orders) > 1:
+                    pending_uids = [p.get('uuid') for p in self.pending_orders if p.get('uuid')]
+                    batched = OrderCanceler.fetch_orders_by_uuids(pending_uids)
+                    if batched and private_ws._is_initialized:
+                        with private_ws._order_lock:
+                            private_ws.order_cache.update(batched)
+                        self._batch_rest_at = now
+
+            # uuid 스냅샷 — clear/pop 동시 발생해도 IndexError 없음
+            pending_snapshot = list(self.pending_orders)
+            for pending_order in pending_snapshot:
+                order_uuid = pending_order.get('uuid')
+                if not order_uuid:
+                    continue
+                # 이미 다른 경로에서 제거됨
+                if order_uuid not in self.pending_by_uuid:
+                    continue
+
+                try:
+                    order_info = self._get_order_info(order_uuid, force_rest=force_rest)
+                    if not order_info:
+                        continue
+
+                    state = str(order_info.get('state', '')).lower()
+
+                    if self._order_is_filled(order_info):
+                        self._process_executed_order(pending_order, None, order_info)
+                        executed_any = True
+                    elif state == 'cancel':
+                        cancelled = self._pop_pending_by_uuid(order_uuid)
+                        if not cancelled:
+                            continue
+                        print_log(LogLevel.INFO,
+                                  f"Order {cancelled['level']} split "
+                                  f"{cancelled.get('split_idx', 0)+1} was cancelled")
+                        self._replace_cancelled_split(cancelled)
+
+                except Exception as e:
+                    print_log(LogLevel.ERROR, f"Error checking order execution: {str(e)}")
+                    continue
+
+        # 재주문 실패분 재시도 (pending 유무와 무관)
+        if self._failed_replaces:
+            now3 = time.time()
+            if now3 - getattr(self, '_last_replace_retry', 0) >= 0.05:
+                self._last_replace_retry = now3
+                for failed in list(self._failed_replaces):
+                    if not self._is_level_executed(failed['level']):
+                        self._replace_cancelled_split(failed)
+
+        # ★ pending 비어 partial만 남은 고착 해제 (매도만 남는 버그)
+        if self._unlock_stuck_partial_levels():
+            executed_any = True
 
         return executed_any
 
@@ -5654,7 +6772,11 @@ class DynamicBuyOrder:
             }
 
             self.executed_orders.append(executed_order)
-            self._pop_pending_at(pending_index)
+            # uuid 기준 pop — 인덱스 기반은 동시 수정 시 오삭제/IndexError
+            if order_uuid:
+                self._pop_pending_by_uuid(order_uuid)
+            elif pending_index is not None:
+                self._pop_pending_at(pending_index)
 
             global buy_uuids
             buy_uuids.discard(order_uuid)
@@ -5668,6 +6790,13 @@ class DynamicBuyOrder:
             self.partial_levels.add(level)
             self.last_executed_level = level
             self.last_executed_price = avg_executed_price
+            # 동일 체결가 재매수 금지
+            fk = self._px_key(avg_executed_price)
+            if fk:
+                if not isinstance(self._blocked_buy_px_keys, set):
+                    self._blocked_buy_px_keys = set()
+                self._blocked_buy_px_keys.add(fk)
+                self._last_buy_px_key = fk
             # 해당 분할 재주문 큐 잔여분 제거 (이미 체결됨)
             self._dequeue_failed_replace(level, split_idx)
 
@@ -5708,9 +6837,39 @@ class DynamicBuyOrder:
 
     def place_dynamic_buy_order(self, price, volume, round_mode='ceil'):
         """매수 주문 실행.
-        round_mode='ceil' (기본) — volume을 거래소 최소단위로 올림 (잔돈 0).
-        round_mode='floor' — volume을 내림 (잔고 흡수 마지막 주문용, 잔고 초과 방지)."""
+        ★ 워커당 미체결 최대 3 + MA60. (POST횟수 HALT/재호가추격 제거)"""
         global buy_uuids
+
+        if getattr(self, '_cycle_ended', False) or getattr(self, '_buys_halted', False):
+            self._last_buy_error = 'cycle_ended'
+            return None
+        if getattr(self, '_ma_gate_paused', False):
+            self._last_buy_error = 'ma60_block'
+            return None
+
+        # ★ HARD CAP: 이미 3개면 POST 자체를 안 함 (로그 없음)
+        # 핫패스: 로컬 우선 — 거래소 카운트는 150ms 캐시 (버스트당 ≤1회)
+        if self._hard_open_buy_count(check_exchange=True) >= MAX_OPEN_BUYS_PER_WORKER:
+            self._last_buy_error = 'max_open_buys'
+            return None
+
+        # HybridMA = 진입 검증만. 매도/체결 진행 중(_skip_ma_gate)이면 POST 허용
+        if not getattr(self, '_skip_ma_gate', False):
+            try:
+                gate_ok, gi = RealMarketData.check_tick_ma_gate(self.symbol)
+                if not gate_ok:
+                    self._last_buy_error = 'ma60_block'
+                    print_log(LogLevel.ERROR,
+                              f"BUY HybridMA FAIL {self.symbol}: "
+                              f"now={gi.get('last_price')} "
+                              f"hybrid={(gi.get('hybrid') or gi.get('ma60'))} "
+                              f"tick={gi.get('ma_tick')} min={gi.get('ma_min')} "
+                              f"— POST 거부")
+                    self.is_active = False
+                    self._ma_gate_paused = True
+                    return None
+            except Exception:
+                pass
 
         self.last_order_time = time.time()
         t_start = time.time()
@@ -5729,6 +6888,64 @@ class DynamicBuyOrder:
             return None
 
         price = UpbitTickSystem.snap_to_tick(price)
+
+        # 타임아웃 재호가 시 시세 아래 호가 금지
+        floor = getattr(self, '_timeout_place_floor', None)
+        if floor is not None and price + 1e-15 < float(floor):
+            price = UpbitTickSystem.snap_to_tick(float(floor), 'ceil')
+
+        # ★ 핫패스: WS/trade pending만 오염검사 (REST ticker 제거 → POST 직전 RTT 0)
+        clean, contaminated = RealMarketData.sanitize_symbol_price(
+            self.symbol, price, force_rest=False)
+        if contaminated and clean and clean > 0:
+            print_log(LogLevel.ERROR,
+                      f"BUY PRICE REJECT {self.symbol}: "
+                      f"{price} → {clean} (오염 교정)")
+            price = UpbitTickSystem.snap_to_tick(clean)
+        elif clean is None:
+            self._last_buy_error = 'price_contamination'
+            print_log(LogLevel.ERROR,
+                      f"BUY PRICE BLOCK {self.symbol} px={price} — 시세검증 실패")
+            return None
+
+        # ★ 동일 평단/동일 pending 호가 절대 금지
+        # 재호가/시세 근처면 prefer_up, 아니면 prefer_down (floor 이상)
+        bad, why = self._is_forbidden_buy_price(price)
+        if bad:
+            live = (getattr(self, 'current_price', None)
+                    or RealMarketData.get_current_price(self.symbol) or price)
+            live_f = float(live or 0)
+            prefer_down = True
+            floor_px = None
+            if floor is not None:
+                floor_px = float(floor)
+                prefer_down = False
+            elif live_f > 0:
+                floor_px = UpbitTickSystem.snap_to_tick(live_f * 0.995, 'floor')
+            alt = self._next_distinct_buy_price(
+                price, prefer_down=prefer_down, floor=floor_px)
+            if alt <= 0:
+                alt = self._next_distinct_buy_price(
+                    price, prefer_down=not prefer_down, floor=floor_px)
+            if alt <= 0:
+                self._last_buy_error = f'forbidden_px:{why}'
+                print_log(LogLevel.ERROR,
+                          f"BUY SAME-PX BLOCK {self.symbol} "
+                          f"px={price} ({why}) — POST 거부")
+                return None
+            alt_key = self._px_key(alt)
+            for p in (self.pending_orders or []):
+                if self._px_key(p.get('actual_price') or p.get('planned_price')) == alt_key:
+                    self._last_buy_error = f'forbidden_px:{why}'
+                    print_log(LogLevel.ERROR,
+                              f"BUY SAME-PX BLOCK {self.symbol} "
+                              f"— 분할호가 충돌 {alt_key}")
+                    return None
+            print_log(LogLevel.WARNING,
+                      f"BUY SAME-PX adjust {self.symbol} "
+                      f"{price}→{alt} ({why})")
+            price = alt
+
         est_krw = price * volume
         # 가용 KRW 스냅샷 (거절 원인 대조)
         try:
@@ -5776,6 +6993,8 @@ class DynamicBuyOrder:
                 order_uuid, err_body = response_order_or_error(response)
                 if order_uuid:
                     buy_uuids.add(order_uuid)
+                    # 캐시 유지: 로컬 pending이 증가하므로 max(local,ex)로 hard cap 충분
+                    # (invalidate 시 분할마다 open-bid REST → POST 지연)
                     if private_ws._is_initialized:
                         with private_ws._order_lock:
                             private_ws.order_cache.setdefault(order_uuid, {
@@ -5839,14 +7058,13 @@ class DynamicBuyOrder:
             if batched and private_ws._is_initialized:
                 with private_ws._order_lock:
                     private_ws.order_cache.update(batched)
-        for i in range(len(self.pending_orders) - 1, -1, -1):
-            pending = self.pending_orders[i]
+        for pending in list(self.pending_orders):
             uid = pending.get('uuid')
-            if not uid:
+            if not uid or uid not in self.pending_by_uuid:
                 continue
             info = self._get_order_info(uid, force_rest=True)
             if self._order_is_filled(info):
-                self._process_executed_order(pending, i, info)
+                self._process_executed_order(pending, None, info)
 
         # 2) 남은 미체결만 일괄 취소 (업비트 DELETE /orders/uuids)
         cancel_uuids = [p.get('uuid') for p in self.pending_orders if p.get('uuid')]
@@ -5919,89 +7137,169 @@ class DynamicBuyOrder:
             return cached
 
     def stop_trading(self):
-        """거래 중지 — 로컬 pending UUID 수거 후 매수 주문 동기 취소(검증)."""
+        """거래 중지 — 해당 심볼 매수만 취소 (타 워커 보호)."""
         self.is_active = False
+        self._buys_halted = True
+        self._cycle_ended = True
         pending_uuids = [p.get('uuid') for p in self.pending_orders if p.get('uuid')]
         pending_uuids.extend(self._collect_pending_uuids_from_index(self.pending_by_uuid))
         self.pending_orders.clear()
         self._reset_runtime_indexes()
         try:
-            cancel_buy_orders_sync(extra_uuids=pending_uuids, verify=True)
+            OrderCanceler().cancel_buy_orders_for_symbol(
+                self.symbol, extra_uuids=pending_uuids, verify=True)
         except Exception as e:
             print_log(LogLevel.WARNING, f"stop_trading cancel buys: {str(e)[:100]}")
         print_log(LogLevel.INFO, f"Trading stopped for {self.symbol}")
 
-    def watchdog_ensure_buy_orders(self):
-        """1분 워치독 — 사다리 미완료인데 매수 주문이 전무하면 재개.
-        (매도만 걸리고 매수가 안 걸리는 간헐 버그 사후 차단)"""
+    def halt_further_buys(self, reason=''):
+        """의도적 매수 중단 (stop 경로용). POST횟수/재호가 HALT 아님."""
+        self._buys_halted = True
+        self.is_active = False
+        try:
+            self._cancel_pending_sync()
+        except Exception:
+            try:
+                OrderCanceler().cancel_buy_orders_for_symbol(
+                    self.symbol, verify=False)
+            except Exception:
+                pass
+        self._clear_pending_tracking_only()
+        self._failed_replaces = []
+        print_log(LogLevel.WARNING,
+                  f"buys stopped {self.symbol}"
+                  + (f" — {reason}" if reason else ""))
+
+    def _buys_allowed(self):
+        """매수 POST 허용 — cycle/stop/쿨다운만.
+        MA pause는 진입대기용. 매도진행(_skip_ma_gate)이면 pause 무시."""
+        if getattr(self, '_buys_halted', False):
+            return False
+        if getattr(self, '_cycle_ended', False):
+            return False
+        if (getattr(self, '_ma_gate_paused', False)
+                and not getattr(self, '_skip_ma_gate', False)):
+            return False
+        if time.time() < float(getattr(self, '_skip_place_until', 0) or 0):
+            return False
+        return True
+
+    def _adopt_exchange_bids_if_any(self):
+        """거래소 open bid를 로컬 pending으로 흡수. 흡수 건수 반환.
+        MA pause 재개·워치독에서 신규 POST 전에 호출 — 중복 매수 방지.
+        ★ MAX_OPEN_BUYS_PER_WORKER 초과 흡수 금지."""
         plans = self.active_planned_orders or []
-        n_plan = len(plans)
-        if n_plan <= 0:
-            return False
-        if self.executed_count >= n_plan:
-            return False  # 사다리 완료 — 매도만 남은 정상 상태
-
-        # 로컬에 미체결/재시도 큐가 있으면 OK
-        if self.pending_orders or self._failed_replaces:
-            return False
-
-        # 거래소 open bid 확인
+        if not plans:
+            return 0
         market = f"KRW-{self.symbol}"
         try:
             open_bids = OrderCanceler().list_open_bid_orders(market=market)
         except Exception:
             open_bids = []
-        if open_bids:
-            # 거래소엔 있는데 로컬 pending 유실 — tracking만 흡수
-            adopted = 0
-            for o in open_bids:
-                uid = order_id_of(o)
-                if not uid or uid in getattr(self, 'pending_by_uuid', {}):
-                    continue
-                try:
-                    px = float(o.get('price') or o.get('p') or 0)
-                    vol = float(o.get('remaining_volume')
-                                or o.get('volume') or o.get('rv') or 0)
-                except (TypeError, ValueError):
-                    px, vol = 0.0, 0.0
-                if px <= 0 or vol <= 0:
-                    continue
-                # 다음 미완료 레벨에 귀속
-                next_lv = None
-                for p in plans:
-                    if not p.get('executed'):
-                        next_lv = p.get('level')
-                        break
-                if next_lv is None:
+        if not open_bids:
+            return 0
+        # 거래소에 이미 3 초과면 먼저 강제 정리
+        if len(open_bids) > MAX_OPEN_BUYS_PER_WORKER:
+            self._enforce_max_open_buys()
+            try:
+                open_bids = OrderCanceler().list_open_bid_orders(market=market)
+            except Exception:
+                open_bids = []
+        adopted = 0
+        for o in open_bids or []:
+            if self._hard_open_buy_count() >= MAX_OPEN_BUYS_PER_WORKER:
+                break
+            uid = order_id_of(o)
+            if not uid or uid in getattr(self, 'pending_by_uuid', {}):
+                continue
+            try:
+                px = float(o.get('price') or o.get('p') or 0)
+                vol = float(o.get('remaining_volume')
+                            or o.get('volume') or o.get('rv') or 0)
+            except (TypeError, ValueError):
+                px, vol = 0.0, 0.0
+            if px <= 0 or vol <= 0:
+                continue
+            next_lv = None
+            for p in plans:
+                if not p.get('executed'):
+                    next_lv = p.get('level')
                     break
-                self._add_pending({
-                    'level': next_lv,
-                    'planned_price': px,
-                    'actual_price': px,
-                    'volume': vol,
-                    'order_time': time.time(),
-                    'uuid': uid,
-                    'split_idx': 0,
-                    'split_total': 1,
-                })
-                buy_uuids.add(uid)
-                adopted += 1
+            if next_lv is None:
+                break
+            ok = self._add_pending({
+                'level': next_lv,
+                'planned_price': px,
+                'actual_price': px,
+                'volume': vol,
+                'order_time': time.time(),
+                'uuid': uid,
+                'split_idx': 0,
+                'split_total': 1,
+            })
+            if ok is False:
+                break
+            buy_uuids.add(uid)
+            adopted += 1
+        if adopted:
+            self.is_active = True
+        return adopted
+
+    def watchdog_ensure_buy_orders(self):
+        """1분 워치독 — 사다리 미완료인데 매수 주문이 전무하면 재개.
+        ★ buys_halted / POST한도면 절대 재POST 안 함."""
+        if not self._buys_allowed():
+            return False
+        plans = self.active_planned_orders or []
+        n_plan = len(plans)
+        if n_plan <= 0:
+            return False
+        if getattr(self, '_cycle_ended', False):
+            return False
+        if self.executed_count >= n_plan:
+            return False
+        if time.time() < float(getattr(self, '_skip_place_until', 0) or 0):
+            return False
+        if getattr(self, '_timeout_requoting', False):
+            return False
+
+        if self.pending_orders or self._failed_replaces:
+            return False
+
+        try:
+            ex_n = int(self._exchange_open_buy_count() or 0)
+        except Exception:
+            ex_n = 0
+        if ex_n > 0:
+            if time.time() < float(getattr(self, '_skip_adopt_until', 0) or 0):
+                return False
+            adopted = self._adopt_exchange_bids_if_any()
             if adopted:
-                self.is_active = True
                 print_log(LogLevel.WARNING,
                           f"buy-watchdog: 거래소 bid {adopted}건 로컬 재흡수 "
                           f"(exec={self.executed_count}/{n_plan})")
                 return True
+            print_log(LogLevel.WARNING,
+                      f"buy-watchdog: 거래소 bid {ex_n}건 잔존 — 재POST 스킵")
             return False
 
-        # ★ 매수 전무 + 사다리 미완료 → 재개
+        # exec=0 + 보유 → L1 재시작 금지 (무한매수)
+        if self.executed_count <= 0:
+            try:
+                if private_ws._is_initialized and private_ws.is_connected:
+                    bal, locked, _ = private_ws.get_symbol_info(self.symbol)
+                    if (float(bal) + float(locked)) > 0:
+                        print_log(LogLevel.WARNING,
+                                  f"buy-watchdog: 보유있음·exec=0 — L1 재POST 금지")
+                        self.is_active = False
+                        return False
+            except Exception:
+                pass
+
         print_log(LogLevel.WARNING,
                   f"buy-watchdog: 매수주문 없음 "
-                  f"(exec={self.executed_count}/{n_plan}, "
-                  f"active={self.is_active}, partial={list(self.partial_levels)}) "
-                  f"— 다음 레벨 재배치")
+                  f"(exec={self.executed_count}/{n_plan}) — 다음 레벨 재배치")
 
-        # 막힌 partial/실패큐 해제
         for lv in list(self.partial_levels):
             if self._is_level_executed(lv):
                 self.partial_levels.discard(lv)
@@ -6015,36 +7313,21 @@ class DynamicBuyOrder:
                 self.partial_levels.discard(lv)
         self._failed_replaces = []
         self.is_active = True
-        # next_plan_idx를 미완료 첫 레벨로
         for i, p in enumerate(plans):
             if not p.get('executed'):
                 self.next_plan_idx = i
                 break
-        ok = self._execute_next_available_order()
-        if ok:
-            print_log(LogLevel.SUCCESS,
-                      f"buy-watchdog: 매수 재개 성공 "
-                      f"(pending={len(self.pending_orders)})")
-        else:
-            print_log(LogLevel.WARNING,
-                      f"buy-watchdog: 재배치 실패 "
-                      f"(pending={len(self.pending_orders)} "
-                      f"partial={list(self.partial_levels)} "
-                      f"failed={len(self._failed_replaces)})")
-        return bool(ok)
+        return bool(self._execute_next_available_order())
 
     def watchdog_fill_timeout(self):
-        """미체결 매수 타임아웃 워치독 — 3초 지나도 취소/재호가 안 된 채
-        무한대기하는 경우를 강제 복구."""
+        """고전 첫주문 타임아웃만 — check_and_continue와 동일 경로."""
+        if getattr(self, '_cycle_ended', False) or getattr(self, '_buys_halted', False):
+            return False
         if not self.is_active:
             return False
-        if not self._should_timeout_requote_pending():
+        if not self._should_first_order_timeout():
             return False
-        age = self._pending_unfilled_age()
-        print_log(LogLevel.WARNING,
-                  f"fill-timeout-watchdog: pending {len(self.pending_orders)}건 "
-                  f"age={age:.1f}s > {self.first_order_timeout}s — 강제 재호가")
-        return self._force_timeout_requote()
+        return self._classic_first_order_timeout()
 
     def get_status(self):
         """상태 정보"""
@@ -6112,7 +7395,7 @@ class DynamicBuyOrder:
         self.first_order_start_time = None
         self.on_buy_fill_sell = None
         try:
-            private_ws.clear_avg_sell_target()
+            private_ws.clear_avg_sell_target(self.symbol)
         except Exception:
             pass
         print_log(LogLevel.INFO, f"Reset completed for {self.symbol}")
@@ -6224,7 +7507,7 @@ class SellOrder:
 class TradingManager:
     """거래 상태 및 캐시 관리 클래스"""
     
-    def __init__(self):
+    def __init__(self, watch_command=True):
         self.current_symbol = None
         self.symbol_cache_time = None
         self.buy_orders_placed = False
@@ -6243,7 +7526,10 @@ class TradingManager:
         # command.txt 백그라운드 감시 — 파일 읽기를 별도 스레드로 분리
         self._command_lines = []  # 백그라운드 스레드가 갱신
         self._command_thread = None
-        self._start_command_watcher()
+        if watch_command:
+            self._start_command_watcher()
+        else:
+            self._load_command_lines()
 
     def _load_command_lines(self):
         """command.txt 1회 동기 로드."""
@@ -6323,13 +7609,40 @@ class TradingManager:
         # 파싱된 심볼 리스트 갱신 — 변경 시 로그
         # 빈 리스트(SYMBOL 줄이 모두 지워진 경우)도 반영하여 자동 선별 모드로 폴백.
         if parsed_symbols != self.current_command_symbols:
+            prev = list(self.current_command_symbols or [])
             self.current_command_symbols = parsed_symbols
+            detected_change = True  # 다중/단일 모두 변경 신호
             if parsed_symbols:
                 # 단일 호환 필드 = 첫 심볼
                 self.current_command_symbol = parsed_symbols[0]
-                print_log(LogLevel.INFO,
+                print_log(LogLevel.SUCCESS,
                           f"Command symbols updated: {parsed_symbols} "
-                          f"({len(parsed_symbols)}개, 기재 순서 폴백)")
+                          f"(prev={prev or '-'}, {len(parsed_symbols)}개)")
+                # ★ 신규 심볼 즉시 구독+MA 시드 (갱신 후 매수 안 되던 버그)
+                try:
+                    added = [s for s in parsed_symbols if s not in set(prev)]
+                    if added:
+                        RealMarketData.subscribe_trade_stream_symbols(added)
+                        for s in added:
+                            try:
+                                RealMarketData.subscribe_websocket(s)
+                            except Exception:
+                                pass
+                            try:
+                                if trade_ws is not None:
+                                    trade_ws.seed_tick_ma(s)
+                            except Exception:
+                                pass
+                            try:
+                                if minute_ma_cache is not None:
+                                    minute_ma_cache.ensure(s)
+                            except Exception:
+                                pass
+                        print_log(LogLevel.SUCCESS,
+                                  f"Command 신규심볼 시드: {added}")
+                except Exception as e:
+                    print_log(LogLevel.WARNING,
+                              f"Command 신규심볼 시드 실패: {str(e)[:80]}")
                 # 단일 심볼만 pending 오버라이드. 다중(≥2)은 select_first_tradable이
                 # 폴백 선택하므로 첫 심볼을 pending에 넣으면 거래 심볼/시세가 꼬임.
                 if len(parsed_symbols) == 1:
@@ -6339,14 +7652,14 @@ class TradingManager:
                             print_log(LogLevel.WARNING, f"Command symbol {first} blocked by volatility protection")
                         else:
                             self.pending_symbol_change = first
-                            detected_change = True
                 else:
                     # 다중 모드: pending이 폴백 선택을 덮어쓰지 않도록 항상 비움
                     self.pending_symbol_change = None
             else:
                 # SYMBOL 줄 모두 제거 — 자동 선별 모드로 폴백
                 self.current_command_symbol = None
-                print_log(LogLevel.INFO,
+                self.pending_symbol_change = None
+                print_log(LogLevel.SUCCESS,
                           "Command symbols cleared — falling back to auto-select")
 
         return detected_change
@@ -6515,6 +7828,49 @@ class SellController:
         self._last_replace_px = 0.0
         self._last_replace_t = 0.0
         self._last_cancel_and_new_t = 0.0
+        self._last_sell_skip = ''
+        self._last_full_sell_attempt_t = 0.0
+        self._last_sell_fail_log_t = 0.0
+
+    def _log_sell_fail_throttled(self, symbol, total_vol, base, why=''):
+        """전량매도 실패 로그 — busy/cooldown은 침묵, 실실패만 5초에 1회."""
+        skip = str(getattr(self, '_last_sell_skip', '') or '')
+        if skip in ('busy', 'cooldown', 'placing'):
+            return
+        now = time.time()
+        if now - float(getattr(self, '_last_sell_fail_log_t', 0) or 0) < 5.0:
+            return
+        self._last_sell_fail_log_t = now
+        print_log(LogLevel.ERROR,
+                  f"전량매도 실패 {symbol} vol={float(total_vol):.8f} "
+                  f"avg={base or 0}"
+                  + (f" ({why})" if why else ""))
+
+    def _force_full_sell(self, symbol, profit_percentages, dynamic_buyer,
+                         total_vol, base=None, min_interval=0.8):
+        """ask 없을 때 전량 POST — 동시호출/연타 차단 후 place."""
+        if getattr(self, '_sell_placing', False):
+            self._last_sell_skip = 'placing'
+            return False
+        if self.has_open_sell_orders() or self._open_sell_count() > 0:
+            return True
+        if self._adopt_open_ask_tracking(symbol):
+            return True
+        now = time.time()
+        last = float(getattr(self, '_last_full_sell_attempt_t', 0) or 0)
+        if now - last < float(min_interval):
+            self._last_sell_skip = 'cooldown'
+            return False
+        self._last_full_sell_attempt_t = now
+        ok = self.place_sell_orders(
+            symbol, profit_percentages, dynamic_buyer,
+            sell_base_price=base, force_replace=True,
+            volume_hint=total_vol)
+        if ok and self._open_sell_count() > 0:
+            return True
+        if ok and self._adopt_open_ask_tracking(symbol):
+            return True
+        return False
 
     def _get_fresh_symbol_info(self, symbol):
         """REST로 balance/locked/avg_buy_price 확정 후 WS 캐시 동기화."""
@@ -6770,9 +8126,8 @@ class SellController:
 
     def _should_replace_for_free(self, symbol, available_volume, ref_price=0.0,
                                    buy_count_increased=False):
-        """열린 매도 위 추가잔량(≥5000원)이 연속 확인되면 True.
-        buy_count_increased면 streak 1로 충분(추가매수 확정).
-        유령 free는 place_sell REST 확정이 최종 차단."""
+        """열린 매도 위 추가잔량(≥5000원)이면 합산 필요.
+        buy_count_increased면 1틱, 아니면 2틱 연속 확인(유령 free 완화)."""
         free_krw = self._free_notional(symbol, available_volume, ref_price)
         if free_krw < MIN_ORDER_AMOUNT:
             self._free_above_min_streak = 0
@@ -6780,7 +8135,7 @@ class SellController:
         if self._in_sell_stable_window():
             return False
         self._free_above_min_streak = getattr(self, '_free_above_min_streak', 0) + 1
-        need = 1 if buy_count_increased else 3
+        need = 1 if buy_count_increased else 2
         return self._free_above_min_streak >= need
 
     def _get_cached_symbol_info(self, symbol):
@@ -6807,11 +8162,53 @@ class SellController:
     def _sell_order_is_filled(self, order_info):
         return order_is_filled(normalize_order(order_info) if order_info else None)
 
-    def _buy_ladder_active(self, dynamic_buyer):
-        """미체결 매수/부분체결/재주문 큐가 살아 있으면 True.
-        '계획만 남음(done < n_plan)'은 포함하지 않음 — 전량매도 후 다음 사이클
-        전환을 영구 차단하는 버그의 원인이었음."""
+    def _ladder_detail(self, dynamic_buyer):
+        """사다리 상태 한 줄 (로그용)."""
         if dynamic_buyer is None:
+            return "buyer=None"
+        plan = getattr(dynamic_buyer, 'active_planned_orders', None) or []
+        pending = getattr(dynamic_buyer, 'pending_orders', None) or []
+        partial = getattr(dynamic_buyer, 'partial_levels', None) or {}
+        failed = getattr(dynamic_buyer, '_failed_replaces', None) or []
+        return (
+            f"sym={getattr(dynamic_buyer, 'symbol', '?')} "
+            f"active={bool(getattr(dynamic_buyer, 'is_active', False))} "
+            f"ended={bool(getattr(dynamic_buyer, '_cycle_ended', False))} "
+            f"exec={int(getattr(dynamic_buyer, 'executed_count', 0) or 0)}/{len(plan)} "
+            f"pending={len(pending)} partial={len(partial)} "
+            f"failed_repl={len(failed)}")
+
+    def _dust_detail(self, symbol, total_vol):
+        """먼지진 판정 상세 (수량·평가액·최소주문금액)."""
+        notional = holding_notional_krw(symbol, total_vol)
+        px = RealMarketData.get_current_price(symbol) or 0.0
+        return (
+            f"{symbol} vol={float(total_vol or 0):.8f} "
+            f"px={float(px):.4f} 평가≈{notional:,.0f}원 "
+            f"한도={MIN_ORDER_AMOUNT}원 "
+            f"먼지={'Y' if 0 < notional < MIN_ORDER_AMOUNT else 'N'}")
+
+    def _log_dust_once(self, key, message, level=None):
+        """동일 key 먼시/사다리 대기 로그는 5초에 1회."""
+        if level is None:
+            level = LogLevel.WARNING
+        now = time.time()
+        last = getattr(self, '_dust_log_ts', None) or {}
+        if now - float(last.get(key, 0) or 0) < 5.0:
+            return
+        last[key] = now
+        self._dust_log_ts = last
+        print_log(level, message)
+
+    def _buy_ladder_active(self, dynamic_buyer):
+        """미체결 매수/부분체결/재주문 큐가 살아 있거나,
+        is_active인 채 미배치 레벨이 남으면 True.
+        _cycle_ended/비활성 바이어는 False — 의도적 종료 후 다음 사이클 허용."""
+        if dynamic_buyer is None:
+            return False
+        if getattr(dynamic_buyer, '_cycle_ended', False):
+            return False
+        if not getattr(dynamic_buyer, 'is_active', False):
             return False
         if getattr(dynamic_buyer, 'pending_orders', None):
             return True
@@ -6819,22 +8216,29 @@ class SellController:
             return True
         if getattr(dynamic_buyer, '_failed_replaces', None):
             return True
+        plan = getattr(dynamic_buyer, 'active_planned_orders', None) or []
+        done = int(getattr(dynamic_buyer, 'executed_count', 0) or 0)
+        if plan and done < len(plan):
+            return True
         return False
 
     def _complete_cycle_on_sell_done(self, trading_manager, dynamic_buyer=None,
                                       force=False, profit_percentages=None):
         """매도 완료 → 잔여 매수 취소 → REST로 전량매도 확정 후에만 사이클 종료.
+        force=True: 사다리 진행 중이어도 매수 취소 후 종료 (보유0/전량매도).
         잔량(≥5000원)이 남으면 재매도하고 False (다음 사이클 금지)."""
         if not force and self._buy_ladder_active(dynamic_buyer):
-            print_log(LogLevel.WARNING,
-                      "cycle-end blocked — buy ladder still active "
-                      f"(exec={getattr(dynamic_buyer, 'executed_count', 0)}/"
-                      f"{len(getattr(dynamic_buyer, 'active_planned_orders', None) or [])}, "
-                      f"pending={len(getattr(dynamic_buyer, 'pending_orders', None) or [])})")
+            self._log_dust_once(
+                'cycle_block',
+                "cycle-end blocked — buy ladder still active "
+                f"({self._ladder_detail(dynamic_buyer)})")
             return False
 
         symbol = getattr(trading_manager, 'current_symbol', None) or (
             getattr(dynamic_buyer, 'symbol', None) if dynamic_buyer else None)
+        print_log(LogLevel.INFO,
+                  f"사이클 종료 진행 force={force} "
+                  f"sym={symbol} | {self._ladder_detail(dynamic_buyer)}")
 
         # 1) 매수 사다리 즉시 정지 (추가 체결 콜백 차단)
         pending_uuids = []
@@ -6847,21 +8251,31 @@ class SellController:
                 DynamicBuyOrder._collect_pending_uuids_from_index(
                     getattr(dynamic_buyer, 'pending_by_uuid', None)))
             dynamic_buyer.is_active = False
+            dynamic_buyer._cycle_ended = True
             dynamic_buyer.pending_orders.clear()
             dynamic_buyer._reset_runtime_indexes()
             dynamic_buyer.on_buy_fill_sell = None
             try:
-                private_ws.clear_avg_sell_target()
+                private_ws.clear_avg_sell_target(symbol)
             except Exception:
                 pass
 
-        # 2) 잔여 매수 동기 취소 (늦은 체결 레이스 축소)
+        # 2) 잔여 매수 — 해당 심볼만 취소 (전역 cancel = 타워커 매수 삭제+재배치 버그)
         try:
-            cancel_buy_orders_sync(extra_uuids=pending_uuids, verify=True)
+            if symbol:
+                OrderCanceler().cancel_buy_orders_for_symbol(
+                    symbol, extra_uuids=pending_uuids, verify=True)
+            elif pending_uuids:
+                OrderCanceler().cancel_orders_parallel(pending_uuids)
         except Exception as e:
             print_log(LogLevel.WARNING,
                       f"cycle-end buy cancel failed: {str(e)[:120]}")
-            cancel_buy_orders_async(extra_uuids=pending_uuids)
+            try:
+                if symbol:
+                    OrderCanceler().cancel_buy_orders_for_symbol(
+                        symbol, extra_uuids=pending_uuids, verify=False)
+            except Exception:
+                pass
 
         # 3) sleep 없이 즉시 REST 전량 확인 — 미완이면 재매도
         if symbol:
@@ -6888,11 +8302,13 @@ class SellController:
                               f"cycle-end re-sell failed: {str(e)[:120]}")
                 return False
 
-        # 4) 매수 재스윕 + REST 재확인 (sleep 없음)
+        # 4) 매수 재스윕 + REST 재확인 (심볼 스코프만)
         try:
-            cancel_buy_orders_sync(verify=True)
+            if symbol:
+                OrderCanceler().cancel_buy_orders_for_symbol(
+                    symbol, verify=True)
         except Exception:
-            cancel_buy_orders_async()
+            pass
         if symbol:
             vol2, notional2, sellable2 = rest_holding_snapshot(symbol)
             if sellable2:
@@ -6918,10 +8334,14 @@ class SellController:
         trading_manager.mark_sell_orders_executed()
         print_log(LogLevel.SELL_SUCCESS,
                   "매도 체결 — 전량확인 후 사이클 종료, 잔여 매수 취소 완료")
+        # 이 워커 매도 UUID만 제거 (전역 clear = 타워커 ask 추적 유실)
+        for e in list(self.sell_orders_tracking or []):
+            uid = e.get('uuid') if isinstance(e, dict) else None
+            if uid:
+                sell_uuids.discard(uid)
         self.sell_orders_tracking = []
         self.filled_sell_count = 0
         self.unfilled_sell_count = 0
-        sell_uuids.clear()
         self._sell_stable_until = 0.0
         self._free_above_min_streak = 0
         self._sell_base_provisional = False
@@ -6929,7 +8349,7 @@ class SellController:
         # 종료 직후 최종 REST (sleep 없음)
         if symbol:
             try:
-                cancel_buy_orders_sync(verify=True)
+                OrderCanceler().cancel_buy_orders_for_symbol(symbol, verify=True)
             except Exception:
                 pass
             vol3, notional3, sellable3 = rest_holding_snapshot(symbol)
@@ -6986,7 +8406,7 @@ class SellController:
         return notional >= MIN_ORDER_AMOUNT
 
     def _resolve_sell_base_price(self, symbol, sell_base_price=None, dynamic_buyer=None):
-        """매도 기준가 — 명시값 > myAsset/서버 캐시. REST 대기 금지."""
+        """매도 기준가 — 명시값 > myAsset > buyer VWAP/체결가. REST 대기 금지."""
         if sell_base_price is not None and float(sell_base_price) > 0:
             return float(sell_base_price)
         _, _, server_avg = self._get_cached_symbol_info(symbol)
@@ -6994,6 +8414,34 @@ class SellController:
             return float(server_avg)
         if self.last_sell_base_price and self.last_sell_base_price > 0:
             return float(self.last_sell_base_price)
+        # ★ 매수체결 직후 WS 평단 지연 → buyer 체결로 즉시 기준가
+        if dynamic_buyer is not None:
+            try:
+                fills = list(getattr(dynamic_buyer, 'executed_orders', None) or [])
+                vol_sum = 0.0
+                cost = 0.0
+                for e in fills:
+                    v = float(e.get('volume') or 0)
+                    px = float(e.get('executed_price') or 0)
+                    if v > 0 and px > 0:
+                        vol_sum += v
+                        cost += v * px
+                if vol_sum > 0 and cost > 0:
+                    return cost / vol_sum
+            except Exception:
+                pass
+            try:
+                lex = float(getattr(dynamic_buyer, 'last_executed_price', 0) or 0)
+                if lex > 0:
+                    return lex
+            except Exception:
+                pass
+        try:
+            floor = float(private_ws.cost_floor_price() or 0)
+            if floor > 0:
+                return floor
+        except Exception:
+            pass
         return 0.0
 
     @staticmethod
@@ -7124,7 +8572,10 @@ class SellController:
             self._sell_place_lock = threading.Lock()
             lock = self._sell_place_lock
         if not lock.acquire(blocking=False):
-            return bool(self.has_open_sell_orders())
+            # 다른 스레드가 POST 중 — 실패가 아님 (ERROR 스팸 금지)
+            self._last_sell_skip = 'busy'
+            return False
+        self._last_sell_skip = ''
         self._sell_placing = True
         try:
             profit_pct = profit_percentages[0] if profit_percentages else 0.0
@@ -7220,20 +8671,44 @@ class SellController:
             open_n = self._open_sell_count()
             hint_vol = max(float(volume_hint or 0), 0.0)
 
+            # ★ 동일호가·동일수량 깜빡임 차단 (전량-fast 루프 원흉)
+            last_px = float(getattr(self, '_last_replace_px', 0) or 0)
+            last_qty = float(getattr(self, '_last_committed_qty', 0) or 0)
+            last_t = float(getattr(self, '_last_replace_t', 0) or 0)
+            age = time.time() - last_t if last_t > 0 else 1e9
+            same_px_qty = (
+                last_px > 0 and last_qty > 0
+                and _px_key(sell_price) == _px_key(last_px)
+                and abs(hint_vol - last_qty) * max(float(sell_price), 1e-15)
+                < float(MIN_ORDER_AMOUNT))
+            if not force_replace and same_px_qty and age < 60.0:
+                if open_n > 0:
+                    return _keep_existing()
+                if self._adopt_open_ask_tracking(symbol):
+                    return True
+                # ★ ask 실존 없으면 쿨다운으로 성공 위장 금지 — 아래 POST
+
             # ── 1) 최초 매도: tracking 없고 hint 있으면 즉시 POST ──
+            # ★ 초고속: REST ask GET 생략 — 캐시만 확인 후 volume_hint로 POST
+            #   (이중POST는 _sell_place_lock + tracking으로 차단)
             if open_n == 0 and hint_vol >= MIN_HOLDING_VOLUME and not force_replace:
-                ask_vol_c, _, _ = _ask_snapshot(force=False)
-                if ask_vol_c <= 0:
-                    bal_w, loc_w, _ = self._get_cached_symbol_info(symbol)
-                    if bal_w < 0:
-                        bal_w, loc_w = 0.0, 0.0
-                    held_fast = max(
-                        hint_vol,
-                        max(float(bal_w), 0.0) + max(float(loc_w), 0.0))
-                    if _post_full(held_fast, sell_price, "전량-fast"):
-                        if avg_refresh:
-                            self._sell_base_provisional = False
+                ask_vol_c, ask_px_c, ask_uid_c = _ask_snapshot(force=False)
+                if ask_vol_c > 0 or ask_uid_c:
+                    if self._adopt_open_ask_tracking(symbol):
                         return True
+                    return _keep_existing()
+                bal_w, loc_w, _ = self._get_cached_symbol_info(symbol)
+                if bal_w < 0:
+                    bal_w, loc_w = 0.0, 0.0
+                held_fast = max(
+                    hint_vol,
+                    max(float(bal_w), 0.0) + max(float(loc_w), 0.0))
+                # ★ ask 없는 상태에서 동일수량 쿨다운 return True 금지
+                #   (취소된 매도 후 매수만 남는 버그 원흉)
+                if _post_full(held_fast, sell_price, "전량-fast"):
+                    if avg_refresh:
+                        self._sell_base_provisional = False
+                    return True
 
             # ── 2) 사후통제 ──
             bal, locked, _ = self._confirmed_ask_available(symbol)
@@ -7343,8 +8818,29 @@ class SellController:
                         tag = ("전량합산" if need_merge
                                else ("교정" if need_reprice else "교체"))
                         return _commit(new_uid, place_px, sell_volume, tag)
-                    # cancel_and_new 거부/실패 — 동일호가면 취소·재POST 금지
-                    # (여기로 떨어지면 예전엔 취소 루프로 4초 깜빡임)
+                    # cancel_and_new 실패 — 합산 필요하면 취소+재POST
+                    # ★ 단 목표 수량·호가가 직전과 같으면 재POST 금지
+                    if need_merge:
+                        if (last_cqty > 0
+                                and _px_key(place_px) == _px_key(last_cpx or cur_px)
+                                and abs(sell_volume - last_cqty) * px_ref
+                                < MIN_ORDER_AMOUNT):
+                            return _keep_existing()
+                        print_log(
+                            LogLevel.WARNING,
+                            f"매도합산 cancel_and_new 실패 → 취소재POST "
+                            f"{symbol} qty={sell_volume:.8f}")
+                        self._cancel_open_asks_for_replace(symbol)
+                        self._open_asks_cache = None
+                        bal2, loc2, _ = self._confirmed_ask_available(symbol)
+                        held2 = max(
+                            float(bal2) + float(max(loc2, 0)),
+                            hint_vol, sell_volume)
+                        if _post_full(held2, place_px, "전량합산"):
+                            if avg_refresh:
+                                self._sell_base_provisional = False
+                            return True
+                        return False
                     if same_tick or same_as_last or not need_force:
                         return _keep_existing()
                     self._cancel_open_asks_for_replace(symbol)
@@ -7642,17 +9138,16 @@ class SellController:
 
     def check_sell_fills(self, symbol, dynamic_buyer):
         """매도 per-order 체결 확인 — Private WS 캐시 우선 (API 호출 최소화).
-        체결된 매도는 되받은 KRW만큼 잠재 매수 예산에 가산.
-        추적 중인 매도 전체가 체결되면 True(사이클 완료) 반환.
-        수동 취소된 매도는 tracking에서 제거만 하고 사이클 종료로 간주하지 않음."""
+        ★ 실제 매도 체결 1건이라도 있으면 True (잔여매수 취소·사이클 종료 트리거).
+        수동 취소만으로는 True 안 됨."""
+        self._sell_filled_this_check = False
         if not self.sell_orders_tracking:
             return False
 
         # 미확인 entry들의 UUID만 일괄 조회
         pending_uuids = [e['uuid'] for e in self.sell_orders_tracking if not e['filled']]
         if not pending_uuids:
-            # 전부 filled 표시만 된 경우 — 실제 체결 건이 있을 때만 사이클 완료
-            # (취소만으로 filled 표시된 뒤 오탐으로 종료되는 것 방지)
+            # 전부 filled 표시만 된 경우 — 실제 체결 건이 있을 때만
             return self.filled_sell_count > 0
 
         # WS 우선 + REST 스로틀 (매 루프 force_rest는 매도 POST까지 지연)
@@ -7665,7 +9160,7 @@ class SellController:
         order_states = self._fetch_order_states_batch(
             pending_uuids, force_rest=force_rest)
 
-        all_filled = True
+        any_real_fill = False
         for entry in self.sell_orders_tracking:
             if entry['filled']:
                 continue
@@ -7682,7 +9177,6 @@ class SellController:
                     entry['filled'] = True  # tracking 정리용 (실제 매도체결 아님)
                     self.unfilled_sell_count = max(0, self.unfilled_sell_count - 1)
                     sell_uuids.discard(entry['uuid'])
-                    all_filled = False
                     continue
                 if entry.get('uuid') in buy_uuids:
                     print_log(LogLevel.WARNING,
@@ -7691,7 +9185,6 @@ class SellController:
                     entry['filled'] = True
                     self.unfilled_sell_count = max(0, self.unfilled_sell_count - 1)
                     sell_uuids.discard(entry['uuid'])
-                    all_filled = False
                     continue
                 entry['filled'] = True
                 self.filled_sell_count += 1
@@ -7702,73 +9195,43 @@ class SellController:
 
                 print_log(LogLevel.SELL_SUCCESS,
                           f"매도#{entry['tier']} 체결 확인 (수량 {executed_vol:.6f} @ {sell_price:,.8f}원)")
-                if dynamic_buyer is not None:
-                    try:
-                        krw = float(executed_vol) * float(sell_price) * COMMISSION
-                        self._reinvest_to_next_buy(dynamic_buyer, krw, entry['tier'])
-                    except Exception:
-                        pass
+                any_real_fill = True
+                self._sell_filled_this_check = True
+                # ★ 재투자/추가매수 금지 — 매도 체결 = 잔여매수 취소 후 사이클 종료
             elif order_info and order_info.get('state') == 'cancel':
-                print_log(LogLevel.WARNING,
-                          f"매도#{entry['tier']} 가 수동 취소됨 — tracking 제거, "
-                          f"다음 루프에서 새 매도 재설정 (사이클 유지)")
+                # 봇 교체/이중POST로 이전 uuid가 cancel된 것 — 즉시 재POST 금지
+                # 거래소에 남은 ask 흡수. 없으면 tracking만 정리.
                 entry['filled'] = True
                 self.unfilled_sell_count = max(0, self.unfilled_sell_count - 1)
                 sell_uuids.discard(entry['uuid'])
-                all_filled = False
+                now_c = time.time()
+                last_c = float(getattr(self, '_sell_cancel_log_ts', 0) or 0)
+                adopted = False
+                try:
+                    adopted = bool(self._adopt_open_ask_tracking(symbol))
+                except Exception:
+                    adopted = False
+                if now_c - last_c >= 5.0:
+                    self._sell_cancel_log_ts = now_c
+                    print_log(
+                        LogLevel.WARNING,
+                        f"매도#{entry['tier']} cancel 감지 — "
+                        + ("열린 ask 흡수·유지" if adopted
+                           else "ask없음, 재POST는 쿨다운 후"))
+                if adopted:
+                    # 흡수 성공 시 직전 commit 시각 갱신 → 전량-fast 쿨다운
+                    self._last_replace_t = time.time()
             else:
-                all_filled = False
+                pass
 
-        # 실제 체결이 1건도 없으면(전부 취소 등) 사이클 종료로 치지 않음
-        return all_filled and self.filled_sell_count > 0
+        return bool(any_real_fill or (
+            self.filled_sell_count > 0
+            and not any(not e.get('filled') for e in self.sell_orders_tracking)))
 
     def _reinvest_to_next_buy(self, dynamic_buyer, krw_amount, sell_tier):
-        """매도로 되받은 KRW를 잠재 매수 주문의 예산에 비례 가산.
-        즉시 주문을 실행하지 않고 예산(quantity)만 늘려둠 — 나중에 해당 레벨이
-        차례가 되어 _execute_single_order 가 호출될 때 가산된 예산이 반영됨.
-        잠재 매수가 0개면, 마지막 체결 지점에 즉시 재매수(예산 가산 불가)."""
-        if not dynamic_buyer or krw_amount < MIN_ORDER_AMOUNT:
-            if krw_amount < MIN_ORDER_AMOUNT:
-                print_log(LogLevel.INFO,
-                          f"매도#{sell_tier} 체결 → 재투자액 {krw_amount:,.0f}원 < {MIN_ORDER_AMOUNT}원, 스킵")
-            return
-
-        # 잠재 매수 주문: 아직 실행된 적도 없고 pending도 아닌 주문
-        pending_levels = dynamic_buyer.pending_levels
-        potential = [o for o in dynamic_buyer.active_planned_orders
-                     if not o['executed'] and o['level'] not in pending_levels]
-
-        if potential:
-            # 잠재 매수 예산에 균등 가산 (즉시 주문 실행 없음)
-            share = krw_amount / len(potential)
-            levels_str = ', '.join(f"L{o['level']}({o['planned_price']:.2f})" for o in potential)
-            print_log(LogLevel.INFO,
-                      f"매도#{sell_tier} 체결 → {krw_amount:,.0f}원을 "
-                      f"잠재 매수 {len(potential)}건 예산에 가산 (건당 +{share:,.0f}원): [{levels_str}]")
-            for order in potential:
-                order['quantity'] += share
-                order['volume'] = order['quantity'] / order['planned_price']
-                print_log(LogLevel.INFO,
-                          f"level {order['level']} ({order['planned_price']:.4f}) 예산 "
-                          f"{order['quantity']-share:,.0f} → {order['quantity']:,.0f}원 (나중에 실행 시 반영)")
-        else:
-            # 잠재 매수가 0개 — 마지막 체결 지점에 즉시 재매수
-            if dynamic_buyer.last_executed_price <= 0 and not dynamic_buyer.executed_orders:
-                print_log(LogLevel.WARNING, f"매도#{sell_tier} 체결 → 잠재/체결 매수 모두 없음, 스킵")
-                return
-            last_price = dynamic_buyer.last_executed_price
-            last_level = dynamic_buyer.last_executed_level
-            if last_price <= 0:
-                last = dynamic_buyer.executed_orders[-1]
-                last_price = last['executed_price']
-                last_level = last['level']
-            volume = krw_amount / last_price if last_price > 0 else 0
-            if volume > 0:
-                dynamic_buyer.place_dynamic_buy_order(last_price, volume)
-                print_log(LogLevel.SUCCESS,
-                          f"매도#{sell_tier} 체결 → 잠재 매수 없음, "
-                          f"마지막 체결 지점 level {last_level} ({last_price:.4f})에 "
-                          f"{krw_amount:,.0f}원 재매수")
+        """폐기 — 매도 체결 후 재투자/추가매수 하지 않음.
+        매도 = 잔여매수 취소 + 사이클 종료."""
+        return
 
     def manage_sell_orders(self, symbol, profit_percentages, trading_manager, wait_count, dynamic_buyer=None):
         """매도 관리 — 한 번 걸면 유지. 취소/재주문은 아래만 허용:
@@ -7807,8 +9270,30 @@ class SellController:
         available_volume = max(balance, 0.0)
         fresh_avg = current_avg if current_avg and current_avg > 0 else 0.0
 
-        # 1) 체결 후 잔량 → 재매도 / 먼지진·보유0 → 사이클 종료
+        # 1) 체결 후: 잔여매수 즉시 취소 → 잔량있으면 재매도 / 없으면 사이클 종료
         if sell_just_filled:
+            # ★ 매도 체결 = 사다리 중지 + 잔여 매수 취소 (재투자 금지)
+            if dynamic_buyer is not None:
+                try:
+                    pending_uuids = [
+                        p.get('uuid') for p in (dynamic_buyer.pending_orders or [])
+                        if p.get('uuid')]
+                    pending_uuids.extend(
+                        DynamicBuyOrder._collect_pending_uuids_from_index(
+                            getattr(dynamic_buyer, 'pending_by_uuid', None)))
+                    dynamic_buyer.is_active = False
+                    dynamic_buyer._buys_halted = True
+                    dynamic_buyer._clear_pending_tracking_only()
+                    dynamic_buyer._failed_replaces = []
+                    OrderCanceler().cancel_buy_orders_for_symbol(
+                        symbol, extra_uuids=pending_uuids, verify=False)
+                    print_log(LogLevel.WARNING,
+                              f"매도 체결 → 잔여매수 취소 {symbol} "
+                              f"| {self._ladder_detail(dynamic_buyer)}")
+                except Exception as e:
+                    print_log(LogLevel.WARNING,
+                              f"매도후 매수취소 실패: {str(e)[:100]}")
+
             if self._holding_sellable(symbol, total_vol):
                 print_log(LogLevel.WARNING,
                           f"매도 체결 후 잔량 남음 vol={total_vol:.8f} "
@@ -7824,20 +9309,24 @@ class SellController:
                     if dynamic_buyer:
                         self._sell_placed_at_buy_count = dynamic_buyer.executed_count
                 return False
-            # 보유0 또는 먼지진(<5000원) — 흡수하고 사이클 종료
+            # 보유0/먼지 — 사이클 종료 (다음 사이클)
             if total_vol >= MIN_HOLDING_VOLUME and is_dust_holding(symbol, total_vol):
                 print_log(LogLevel.WARNING,
-                          f"매도 후 먼지진 "
-                          f"≈{holding_notional_krw(symbol, total_vol):,.0f}원 "
-                          f"— 흡수 후 사이클 종료")
+                          f"매도 후 먼지진 사이클종료 — "
+                          f"{self._dust_detail(symbol, total_vol)} | "
+                          f"{self._ladder_detail(dynamic_buyer)}")
                 self.dust_holdings = True
             else:
                 self.dust_holdings = False
+                print_log(LogLevel.INFO,
+                          f"매도 체결·보유0 — 매수취소·사이클종료 "
+                          f"{symbol} vol={total_vol:.8f} | "
+                          f"{self._ladder_detail(dynamic_buyer)}")
             return self._complete_cycle_on_sell_done(
                 trading_manager, dynamic_buyer, force=True,
                 profit_percentages=profit_percentages)
 
-        # 먼지 (주문 불가) — 매도 이력 있으면 무조건 사이클 종료 (사다리 가드 무시)
+        # 먼지 (주문 불가) — 매도 이력 있으면 종료(매수취소). 사다리 때문에 붙잡지 않음.
         if total_vol >= MIN_HOLDING_VOLUME and is_dust_holding(symbol, total_vol):
             if self.has_open_sell_orders() or sell_uuids:
                 self._cancel_open_asks_for_replace(symbol)
@@ -7846,19 +9335,82 @@ class SellController:
                     or trading_manager.sell_orders_executed
                     or trading_manager.buy_orders_executed):
                 print_log(LogLevel.WARNING,
-                          f"먼지진 ≈{holding_notional_krw(symbol, total_vol):,.0f}원 "
-                          f"— 매도불가 잔량 흡수, 사이클 종료")
+                          f"먼지진 사이클종료 — "
+                          f"{self._dust_detail(symbol, total_vol)} | "
+                          f"{self._ladder_detail(dynamic_buyer)}")
                 return self._complete_cycle_on_sell_done(
                     trading_manager, dynamic_buyer, force=True,
                     profit_percentages=profit_percentages)
+            self._log_dust_once(
+                f'dust_no_history:{symbol}',
+                f"먼지진(매도이력없음) 유지 — "
+                f"{self._dust_detail(symbol, total_vol)}")
             return False
         self.dust_holdings = False
 
         if total_vol < MIN_HOLDING_VOLUME:
             if self.has_open_sell_orders():
                 return False
+            # ★ 매수체결 있는데 매도 미걸림 + 보유캐시0 → 사이클종료 금지, REST 재조회
+            buy_done = bool(
+                (dynamic_buyer and int(getattr(dynamic_buyer, 'executed_count', 0) or 0) > 0)
+                or trading_manager.buy_orders_executed)
+            no_sell = (not trading_manager.sell_orders_placed
+                       and not self.has_open_sell_orders())
+            if buy_done and no_sell:
+                bal2, loc2, avg2 = self._get_fresh_symbol_info(symbol)
+                if bal2 >= 0:
+                    total_vol = max(float(bal2), 0.0) + max(float(loc2), 0.0)
+                    available_volume = max(float(bal2), 0.0)
+                    if avg2 and avg2 > 0:
+                        fresh_avg = float(avg2)
+                if self._holding_sellable(symbol, total_vol):
+                    base = fresh_avg if fresh_avg and fresh_avg > 0 else None
+                    ok = self._force_full_sell(
+                        symbol, profit_percentages, dynamic_buyer,
+                        total_vol, base=base)
+                    if ok:
+                        trading_manager.mark_sell_orders_placed()
+                        if dynamic_buyer:
+                            self._sell_placed_at_buy_count = (
+                                dynamic_buyer.executed_count)
+                        print_log(LogLevel.SUCCESS,
+                                  f"보유캐시0→REST복구 전량매도 {symbol} "
+                                  f"vol={total_vol:.8f}")
+                    else:
+                        self._log_sell_fail_throttled(
+                            symbol, total_vol, base, 'rest-recover')
+                    return False
+                # REST도 0이면 힌트(체결수량)로라도 POST 시도
+                hint = 0.0
+                try:
+                    for e in (getattr(dynamic_buyer, 'executed_orders', None) or []):
+                        hint += float(e.get('volume') or 0)
+                except Exception:
+                    hint = 0.0
+                if hint >= MIN_HOLDING_VOLUME:
+                    base = fresh_avg if fresh_avg and fresh_avg > 0 else None
+                    ok = self._force_full_sell(
+                        symbol, profit_percentages, dynamic_buyer,
+                        hint, base=base)
+                    if ok:
+                        trading_manager.mark_sell_orders_placed()
+                        if dynamic_buyer:
+                            self._sell_placed_at_buy_count = (
+                                dynamic_buyer.executed_count)
+                    else:
+                        self._log_sell_fail_throttled(
+                            symbol, hint, base, 'hint-recover')
+                    return False
+                return False  # 아직 매도 안 걸림 — 종료하지 않음
+            # ★ 보유0 = 매도완료 → 잔여 매수 취소 후 다음 사이클 (사다리 유지 금지)
             if (trading_manager.sell_orders_placed
-                    or trading_manager.sell_orders_executed):
+                    or trading_manager.sell_orders_executed
+                    or trading_manager.buy_orders_executed
+                    or self._buy_ladder_active(dynamic_buyer)):
+                print_log(LogLevel.INFO,
+                          f"보유0 사이클종료(매수취소) — {symbol} | "
+                          f"{self._ladder_detail(dynamic_buyer)}")
                 return self._complete_cycle_on_sell_done(
                     trading_manager, dynamic_buyer, force=True,
                     profit_percentages=profit_percentages)
@@ -7894,20 +9446,53 @@ class SellController:
                         self._sell_placed_at_buy_count = dynamic_buyer.executed_count
                 return False
             else:
-                # 열린 매도 1건 — 매수 체결 수 증가 시에만 합산
-                # (주기 place = 동일수량 전량합산 깜빡임 주범 → 삭제)
+                # 열린 매도 1건 — 매수체결↑ OR 가용잔량≥5000원이면 무조건 합산갱신
                 buy_up = bool(
                     dynamic_buyer
                     and dynamic_buyer.executed_count > self._sell_placed_at_buy_count)
-                if buy_up:
+                need_free = self._should_replace_for_free(
+                    symbol, available_volume,
+                    ref_price=fresh_avg or None,
+                    buy_count_increased=buy_up)
+                if buy_up or need_free:
+                    t0 = float(getattr(self, '_last_replace_t', 0) or 0)
+                    q0 = float(getattr(self, '_last_committed_qty', 0) or 0)
                     base = fresh_avg if fresh_avg and fresh_avg > 0 else None
-                    if self.place_sell_orders(symbol, profit_percentages, dynamic_buyer,
-                                              sell_base_price=base, force_replace=False,
-                                              volume_hint=total_vol,
-                                              avg_refresh=False):
+                    ok = self.place_sell_orders(
+                        symbol, profit_percentages, dynamic_buyer,
+                        sell_base_price=base, force_replace=False,
+                        volume_hint=total_vol,
+                        avg_refresh=bool(buy_up))
+                    if ok:
                         trading_manager.mark_sell_orders_placed()
-                        self._sell_placed_at_buy_count = (
-                            dynamic_buyer.executed_count)
+                    # keep/락미스는 True여도 워터마크 올리지 않음 → 재시도 가능
+                    actually = (
+                        float(getattr(self, '_last_replace_t', 0) or 0) > t0 + 1e-9
+                        or float(getattr(self, '_last_committed_qty', 0) or 0)
+                        > q0 + 1e-12)
+                    if actually:
+                        self._free_above_min_streak = 0
+                        if dynamic_buyer:
+                            self._sell_placed_at_buy_count = (
+                                dynamic_buyer.executed_count)
+                        print_log(
+                            LogLevel.SUCCESS,
+                            f"매도물량 합산갱신 {symbol} "
+                            f"free={available_volume:.8f} "
+                            f"total={total_vol:.8f} "
+                            f"({'buy_up' if buy_up else 'free_vol'})")
+                    elif need_free:
+                        now_l = time.time()
+                        last_l = float(
+                            getattr(self, '_free_merge_pending_log_ts', 0) or 0)
+                        if now_l - last_l >= 5.0:
+                            self._free_merge_pending_log_ts = now_l
+                            print_log(
+                                LogLevel.WARNING,
+                                f"매도물량 합산대기 {symbol}: "
+                                f"free≈{self._free_notional(symbol, available_volume, fresh_avg):,.0f}원 "
+                                f"streak={getattr(self, '_free_above_min_streak', 0)} "
+                                f"— place 미반영, 재시도")
                 return False
 
         # 3) 매도 없음 + 보유 → 거래소 ask 확인 후 없을 때만 신규
@@ -7916,13 +9501,127 @@ class SellController:
                 trading_manager.mark_sell_orders_placed()
                 return False
             base = fresh_avg if fresh_avg and fresh_avg > 0 else None
-            if self.place_sell_orders(symbol, profit_percentages, dynamic_buyer,
-                                      sell_base_price=base, force_replace=False,
-                                      volume_hint=total_vol):
+            ok = self._force_full_sell(
+                symbol, profit_percentages, dynamic_buyer,
+                total_vol, base=base)
+            if ok:
                 trading_manager.mark_sell_orders_placed()
                 if dynamic_buyer:
                     self._sell_placed_at_buy_count = dynamic_buyer.executed_count
+            else:
+                self._log_sell_fail_throttled(
+                    symbol, total_vol, base, 'section3')
         return False
+
+
+class MinuteMaCache:
+    """1분봉 MA60 — 핫패스 REST 금지.
+    CandleCache로 시드/백그라운드 갱신만. get_ma60은 메모리 읽기.
+    Upbit 1분 REST는 최신봉=진행중 봉 포함 (틱 MA와 동일 철학)."""
+
+    BG_INTERVAL_S = 25.0
+
+    def __init__(self):
+        try:
+            from .config import MINUTE_MA_PERIOD
+            period = int(MINUTE_MA_PERIOD)
+        except Exception:
+            period = 60
+        self.PERIOD = max(1, period)
+        self._closes = {}  # {symbol: deque(maxlen=PERIOD)} 과거→최신
+        self._symbols = set()
+        self._lock = threading.RLock()
+        self._bg_stop = threading.Event()
+        self._bg_thread = None
+
+    def ensure(self, symbols):
+        """심볼 등록 + 미시드분만 seed + bg 시작."""
+        add = []
+        for s in (symbols if isinstance(symbols, (list, tuple, set)) else [symbols]):
+            if not s:
+                continue
+            add.append(str(s).upper())
+        if not add:
+            return
+        with self._lock:
+            for su in add:
+                self._symbols.add(su)
+            need = [su for su in add if su not in self._closes
+                    or len(self._closes.get(su) or []) < self.PERIOD]
+        for su in need:
+            self.seed(su)
+        self._ensure_bg()
+
+    def seed(self, symbol):
+        """CandleCache에서 1분 종가 PERIOD개 적재 (최신=진행중 봉)."""
+        if not symbol:
+            return False
+        su = str(symbol).upper()
+        try:
+            candles = CandleCache.get_candles(su, self.PERIOD)
+        except Exception:
+            candles = []
+        if not candles:
+            return False
+        # API: 최신→과거. 과거→최신 deque로 저장
+        closes = []
+        for c in reversed(candles[:self.PERIOD]):
+            try:
+                px = float(c.get('trade_price') or 0)
+            except (TypeError, ValueError):
+                px = 0.0
+            if px > 0:
+                closes.append(px)
+        if len(closes) < self.PERIOD:
+            return False
+        with self._lock:
+            self._closes[su] = deque(closes[-self.PERIOD:], maxlen=self.PERIOD)
+            self._symbols.add(su)
+        return True
+
+    def get_ma60(self, symbol):
+        """메모리 전용 SMA. PERIOD 미만이면 None."""
+        if not symbol:
+            return None
+        su = str(symbol).upper()
+        with self._lock:
+            closes = self._closes.get(su)
+            if not closes or len(closes) < self.PERIOD:
+                return None
+            vals = list(closes)[-self.PERIOD:]
+        return sum(vals) / len(vals)
+
+    def get_buffer_size(self, symbol):
+        if not symbol:
+            return 0
+        su = str(symbol).upper()
+        with self._lock:
+            return len(self._closes.get(su) or [])
+
+    def _ensure_bg(self):
+        with self._lock:
+            if self._bg_thread and self._bg_thread.is_alive():
+                return
+            self._bg_stop.clear()
+            self._bg_thread = threading.Thread(
+                target=self._bg_loop, name='minute-ma-bg', daemon=True)
+            self._bg_thread.start()
+
+    def _bg_loop(self):
+        while not self._bg_stop.wait(self.BG_INTERVAL_S):
+            with self._lock:
+                syms = list(self._symbols)
+            for su in syms:
+                try:
+                    # TTL 만료 유도 후 재조회
+                    CandleCache.invalidate(su)
+                    self.seed(su)
+                except Exception:
+                    pass
+
+
+# 모듈 싱글톤 — CandleCache 정의 후 생성 (아래 블록에서 재바인딩)
+minute_ma_cache = None
 
 
 class CandleCache:
@@ -7955,8 +9654,14 @@ class CandleCache:
             if candles:
                 cls._cache[symbol] = {'candles': candles, 'time': now}
                 return candles[:count] if len(candles) >= count else candles
+            # 신규상장 직후 빈 응답 — 예외/경고 없이 [] (캐시 오염 방지)
+            return entry['candles'][:count] if entry else []
         except Exception as e:
-            print_log(LogLevel.WARNING, f"CandleCache 조회 실패 ({symbol}): {str(e)[:80]}")
+            # 404/미상장 등은 1회만 짧게 — 반복 스팸 금지
+            err = str(e)[:80]
+            if '404' not in err and 'not found' not in err.lower():
+                print_log(LogLevel.WARNING,
+                          f"CandleCache 조회 실패 ({symbol}): {err}")
         return entry['candles'][:count] if entry else []
 
     @classmethod
@@ -7968,41 +9673,91 @@ class CandleCache:
             cls._cache.clear()
 
 
+# MinuteMaCache는 CandleCache에 의존 — 클래스 정의 후 인스턴스화
+minute_ma_cache = MinuteMaCache()
+
+
 class CandleInfoFetcher:
+    """1분 캔들 OHLC 로더. 신규상장/데이터부족 시 raise 없이 ok=False."""
+
+    @staticmethod
+    def _f(c, *keys):
+        if not isinstance(c, dict):
+            return 0.0
+        for k in keys:
+            v = c.get(k)
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
     def __init__(self, symbol):
         count = 200
-        # CandleCache 우선 — 동일 심볼의 반복 생성 시 REST 호출 0회
-        self.response_dict = CandleCache.get_candles(symbol, count)
+        self.symbol = str(symbol or '').upper()
+        self.ok = False
+        self.opening_prices = []
+        self.trade_prices = []
+        self.high_prices = []
+        self.low_prices = []
+        self.acc_trade_prices = []
+        self.acc_trade_volumes = []
+        self.current_price = 0.0
+        self.response_dict = CandleCache.get_candles(self.symbol, count) or []
         if not self.response_dict:
-            print_log(LogLevel.EXCEPTION, "Failed to fetch candle data")
-            raise Exception("CandleInfoFetcher")
+            return
 
-        # 한 번의 역순 순회로 6개 배열 동시 생성 (1200회 → 200회 인덱싱)
-        # API 응답은 최신→과거 순서 → 역순(과거→최신)으로 재배열
-        rd = self.response_dict
-        n = len(rd)
-        self.opening_prices = [0] * n
-        self.trade_prices = [0] * n
-        self.high_prices = [0] * n
-        self.low_prices = [0] * n
-        self.acc_trade_prices = [0] * n
-        self.acc_trade_volumes = [0] * n
-        for i in range(n):
-            j = n - 1 - i  # 역순 인덱스
-            c = rd[i]
-            self.opening_prices[j] = c['opening_price']
-            self.trade_prices[j] = c['trade_price']
-            self.high_prices[j] = c['high_price']
-            self.low_prices[j] = c['low_price']
-            self.acc_trade_prices[j] = c['candle_acc_trade_price']
-            self.acc_trade_volumes[j] = c['candle_acc_trade_volume']
-        self.current_price = self.trade_prices[-1]
+        # API 응답은 최신→과거 → 역순(과거→최신). 필드 누락 행은 스킵.
+        rows = []
+        for c in self.response_dict:
+            o = self._f(c, 'opening_price', 'openingPrice')
+            t = self._f(c, 'trade_price', 'tradePrice')
+            h = self._f(c, 'high_price', 'highPrice')
+            lo = self._f(c, 'low_price', 'lowPrice')
+            if t <= 0 and h <= 0 and lo <= 0:
+                continue
+            if t <= 0:
+                t = h if h > 0 else lo
+            if h <= 0:
+                h = max(t, lo)
+            if lo <= 0:
+                lo = min(t, h) if h > 0 else t
+            if o <= 0:
+                o = t
+            rows.append((
+                o, t, h, lo,
+                self._f(c, 'candle_acc_trade_price', 'candleAccTradePrice'),
+                self._f(c, 'candle_acc_trade_volume', 'candleAccTradeVolume'),
+            ))
+        if not rows:
+            return
+        n = len(rows)
+        self.opening_prices = [0.0] * n
+        self.trade_prices = [0.0] * n
+        self.high_prices = [0.0] * n
+        self.low_prices = [0.0] * n
+        self.acc_trade_prices = [0.0] * n
+        self.acc_trade_volumes = [0.0] * n
+        for i, (o, t, h, lo, ap, av) in enumerate(rows):
+            j = n - 1 - i
+            self.opening_prices[j] = o
+            self.trade_prices[j] = t
+            self.high_prices[j] = h
+            self.low_prices[j] = lo
+            self.acc_trade_prices[j] = ap
+            self.acc_trade_volumes[j] = av
+        self.current_price = self.trade_prices[-1] if self.trade_prices else 0.0
+        self.ok = self.current_price > 0 and len(self.trade_prices) > 0
+
 
 class VolatilityProtector:
     """동적 매수 보호 클래스 - 고변동성 코인 매수 방지"""
     
     @staticmethod
-    def check_volatility_protection(symbol, lookback_period=60, threshold_percentage=50.0):
+    def check_volatility_protection(symbol, lookback_period=60, threshold_percentage=50.0,
+                                      quiet=False):
         """
         변동성 보호 체크
         최근 lookback_period 캔들 동안 최소값과 최대값 차이가 threshold_percentage 이상이면 매수 금지
@@ -8011,6 +9766,7 @@ class VolatilityProtector:
             symbol: 심볼명
             lookback_period: 확인할 캔들 수 (기본 60개)
             threshold_percentage: 변동성 임계값 (기본 40%)
+            quiet: True면 통과/상세 로그 생략 (감시 루프용). 차단 시에는 항상 WARNING.
             
         Returns:
             bool: True=보호 적용(매수금지), False=매수 가능
@@ -8020,18 +9776,35 @@ class VolatilityProtector:
             count = max(lookback_period, 60)  # 최소 60개
             candles = CandleCache.get_candles(symbol, count)
 
+            # 신규상장/캔들부족 — 변동성 판정 불가 → 매수 차단 (조용히)
             if not candles or len(candles) < lookback_period:
-                print_log(LogLevel.WARNING, f"Not enough candle data for {symbol}, skipping volatility check")
-                return False
+                if not quiet:
+                    print_log(LogLevel.WARNING,
+                              f"Not enough candle data for {symbol} "
+                              f"({len(candles or [])}/{lookback_period}) — BUY BLOCKED")
+                return True
             
             # 최근 lookback_period개의 고가/저가 추출
             high_prices = []
             low_prices = []
             
             for i in range(min(lookback_period, len(candles))):
-                candle = candles[i]
-                high_prices.append(float(candle['high_price']))
-                low_prices.append(float(candle['low_price']))
+                candle = candles[i] if isinstance(candles[i], dict) else None
+                if not candle:
+                    continue
+                try:
+                    h = float(candle.get('high_price')
+                              or candle.get('highPrice') or 0)
+                    lo = float(candle.get('low_price')
+                               or candle.get('lowPrice') or 0)
+                except (TypeError, ValueError):
+                    continue
+                if h > 0 and lo > 0:
+                    high_prices.append(h)
+                    low_prices.append(lo)
+            
+            if not high_prices or not low_prices:
+                return True  # 필드 누락 — 차단
             
             # 최소값과 최대값 계산
             min_price = min(low_prices)
@@ -8041,12 +9814,13 @@ class VolatilityProtector:
             if min_price > 0:
                 volatility_percentage = ((max_price - min_price) / min_price) * 100
             else:
-                return False
+                return True
             
-            print_log(LogLevel.INFO, 
-                     f"Volatility Check for {symbol}: "
-                     f"Min={min_price:,.0f}, Max={max_price:,.0f}, "
-                     f"Volatility={volatility_percentage:.2f}% (Threshold: {threshold_percentage}%)")
+            if not quiet:
+                print_log(LogLevel.INFO, 
+                         f"Volatility Check for {symbol}: "
+                         f"Min={min_price:,.0f}, Max={max_price:,.0f}, "
+                         f"Volatility={volatility_percentage:.2f}% (Threshold: {threshold_percentage}%)")
             
             # 임계값 초과 시 보호 적용
             if volatility_percentage >= threshold_percentage:
@@ -8055,13 +9829,16 @@ class VolatilityProtector:
                          f"{volatility_percentage:.2f}% >= {threshold_percentage}% - BUY BLOCKED")
                 return True
             else:
-                print_log(LogLevel.INFO, 
-                         f"Volatility within safe range for {symbol}: "
-                         f"{volatility_percentage:.2f}% < {threshold_percentage}%")
+                if not quiet:
+                    print_log(LogLevel.INFO, 
+                             f"Volatility within safe range for {symbol}: "
+                             f"{volatility_percentage:.2f}% < {threshold_percentage}%")
                 return False
                 
         except Exception as e:
-            print_log(LogLevel.EXCEPTION, f"Error in volatility protection check for {symbol}: {str(e)}")
+            if not quiet:
+                print_log(LogLevel.WARNING,
+                          f"volatility check 오류 {symbol}: {str(e)[:80]} — BUY BLOCKED")
             # 에러 발생 시 보호 적용 (안전 측면)
             return True
 
@@ -8086,17 +9863,17 @@ class MarketAnalyzer:
         return var ** 0.5
 
     def __init__(self, symbol):
-        self.candle = CandleInfoFetcher(symbol)
-        self.symbol = symbol
-
-        prices = self.candle.trade_prices  # list[float]
-
-        self.ma20 = self._sma(prices, 20)
-        self.ma60 = self._sma(prices, 60)
-        self.std20 = self._stddev(prices, 20)
-        self.volatility_ratio = self.std20 / self.ma20 if self.ma20 > 0 else 0
+        self.symbol = str(symbol or '').upper()
+        self.candle = CandleInfoFetcher(self.symbol)
+        prices = list(self.candle.trade_prices or [])
+        self.ok = bool(getattr(self.candle, 'ok', False) and prices)
+        self.ma60 = self._sma(prices, 60) if self.ok else 0.0
+        self.std60 = self._stddev(prices, 60) if self.ok else 0.0
+        self.volatility_ratio = self.std60 / self.ma60 if self.ma60 > 0 else 0
 
     def is_below_ma60(self):
+        if not self.ok or self.ma60 <= 0:
+            return False
         return self.candle.current_price < self.ma60
 
 class SymbolSelector:
@@ -8306,9 +10083,9 @@ def main():
             raise SystemExit(2)
 
         VERBOSE = False
-        AUTO_SELECT = False  # command.txt 심볼 사용
+        AUTO_SELECT = True  # CV TopN + HybridMA+vol (command.txt 폐지)
 
-        drop_percentage = 11 / 30
+        drop_percentage = 13 / 30
         distribution_type = DynamicBuyOrder.DistributionType.EXPLOSIVE
         distribution_weight = 1 / 30
         profit_percentage = 0.149
@@ -8327,6 +10104,14 @@ def main():
         UpbitWebSocket.WS_URL = EXCHANGE['ws_public_url']
         UpbitPrivateWS.WS_URL = EXCHANGE['ws_private_url']
         print_log(LogLevel.SUCCESS, f"거래소: {EXCHANGE['name']} ({SERVER_URL})")
+        try:
+            from .config import PARALLEL_WORKERS as _PW
+            from .worker_pool import describe_alloc_table
+            print_log(LogLevel.INFO,
+                      f"병렬워커: {describe_alloc_table()}")
+            order_rate_limiter.set_active_workers(_PW)
+        except Exception as _e:
+            print_log(LogLevel.WARNING, f"worker_pool boot: {_e}")
 
         # 거래소별 API 키 파일 로드
         #   upbit   → key.txt (project root)        (기존 호환)
@@ -8346,7 +10131,19 @@ def main():
             raise
 
         # DNS + TLS + 인증 REST 프리웜 — 첫 주문 핸드셰이크/JWT 스파이크 제거
-        warm_http_connections(auth=True)
+        _warm_done = threading.Event()
+
+        def _warm_boot():
+            try:
+                warm_http_connections(auth=True)
+            except Exception:
+                pass
+            finally:
+                _warm_done.set()
+
+        threading.Thread(
+            target=_warm_boot, name='http-warm', daemon=True).start()
+        _warm_done.wait(8.0)
 
         START_TIME = datetime.now()
 
@@ -8370,17 +10167,38 @@ def main():
         S = int(S)
 
         volatility_scanner = None
-        if AUTO_SELECT and WEBSOCKET_AVAILABLE:
+        if WEBSOCKET_AVAILABLE:
             print_log(LogLevel.INFO, "Starting VolatilityScanner (AUTO_SELECT)...")
             scan_symbols = SymbolSelector.get_all_krw_markets()
             if scan_symbols:
                 volatility_scanner = VolatilityScanner()
                 volatility_scanner.start(scan_symbols)
+                globals()['volatility_scanner'] = volatility_scanner
             else:
                 print_log(LogLevel.WARNING, "No symbols for VolatilityScanner — REST 폴백")
+        else:
+            print_log(LogLevel.WARNING, "WS 미가용 — VolatilityScanner 생략")
 
         cycle_count = 0
         cycle_start_krw = 0.0
+
+        # ── 병렬 워커 모드 (PARALLEL_WORKERS >= 2) ──
+        try:
+            from .config import PARALLEL_WORKERS as _PW, AUTO_SELECT_TOP_N as _TOP_N
+        except Exception:
+            _PW, _TOP_N = 3, 3
+        if int(_PW) >= 2:
+            from .cycle_runner import run_parallel_supervisor_loop
+            run_parallel_supervisor_loop(
+                drop_percentage=drop_percentage,
+                drop_count=7,
+                distribution_type=distribution_type,
+                distribution_weight=distribution_weight,
+                profit_percentage=profit_percentage,
+                max_workers=min(int(_PW), int(_TOP_N)),
+            )
+            return
+
         while True:
             cycle_count += 1
 
@@ -8397,7 +10215,7 @@ def main():
             if (AUTO_SELECT and volatility_scanner and volatility_scanner.is_running
                     and not cycle_locked):
                 cached_symbol = None
-            # 다중 심볼 폴백: 매수 전 MA20 재평가만 허용.
+            # 다중 심볼 폴백: 매수 전 MA60 재평가만 허용.
             # 사이클 잠금 중에는 캐시를 비우지 않음 — 심볼 갈아타기 방지.
             if (not AUTO_SELECT
                     and len(trading_manager.current_command_symbols) >= 2
@@ -8443,7 +10261,7 @@ def main():
                 symbol_from_command = None
                 if not AUTO_SELECT:
                     # 다중 심볼 폴백 — command.txt의 심볼 리스트를 기재 순서대로 순회하여
-                    # 첫 번째로 MA20 게이트를 통과하는 심볼 선택.
+                    # 첫 번째로 MA60 게이트를 통과하는 심볼 선택.
                     command_symbols = trading_manager.current_command_symbols
                     if command_symbols:
                         symbol_from_command, tried = RealMarketData.select_first_tradable_symbol(
@@ -8467,7 +10285,7 @@ def main():
                     cmds = trading_manager.current_command_symbols
                     if cmds:
                         print_log(LogLevel.WARNING,
-                                  f"command 심볼 MA20 미통과 {cmds} — "
+                                  f"command 심볼 MA60 미통과 {cmds} — "
                                   f"전체마켓 선별 금지, 재시도")
                     else:
                         print_log(LogLevel.WARNING,
@@ -8502,9 +10320,9 @@ def main():
 
             # 웹소켓 ticker 구독 (심볼 확정 시)
             RealMarketData.subscribe_websocket(symbol)
-            # 60틱 MA20 매수 게이트용 체결가 스트림 구독.
+            # 60틱 MA60 매수 게이트용 체결가 스트림 구독.
             # 다중 심볼(command.txt에 2개 이상)일 때는 전체 심볼을 동시 구독하여
-            # 폴백 시 각 심볼의 MA20을 즉시 사용할 수 있도록 함.
+            # 폴백 시 각 심볼의 MA60을 즉시 사용할 수 있도록 함.
             command_syms = trading_manager.current_command_symbols
             if (not AUTO_SELECT and len(command_syms) >= 2):
                 RealMarketData.subscribe_trade_stream_symbols(command_syms)
@@ -8617,7 +10435,7 @@ def main():
                 if rest_sellable:
                     resume_skip_l1 = True
 
-                # 60틱 MA20 매수 진입 게이트 — 현재 체결가가 MA20 아래일 때만 매수.
+                # 60틱 MA60 매수 진입 게이트 — 현재 체결가가 MA60 아래일 때만 매수.
                 # 먼지진/재개 매수는 게이트 무시 (잔량·미완료 사이클 방치 방지).
                 if not dust_hold and not resume_parallel:
                     gate_ok, gate_info = RealMarketData.check_tick_ma_gate(symbol)
@@ -8626,10 +10444,14 @@ def main():
                         if now_g - getattr(trading_manager, '_last_gate_log', 0) >= 1.0:
                             trading_manager._last_gate_log = now_g
                             print_log(LogLevel.WARNING,
-                                      f"MA20 gate block {symbol}: "
+                                      f"HybridMA gate block {symbol}: "
                                       f"px={gate_info.get('last_price')} "
-                                      f"ma20={gate_info.get('ma20')} "
-                                      f"candles={gate_info.get('candle_count')}")
+                                      f"hybrid={(gate_info.get('hybrid') or gate_info.get('ma60'))} "
+                                      f"tick={gate_info.get('ma_tick')} "
+                                      f"min={gate_info.get('ma_min')} "
+                                      f"w_tick={gate_info.get('w_tick')} "
+                                      f"candles={gate_info.get('candle_count')}/"
+                                      f"{gate_info.get('min_candle_count')}")
                         # 게이트 대기 — 사이클 카운트/배너 스팸 방지
                         cycle_count -= 1
                         time.sleep(1.0)
@@ -8641,7 +10463,7 @@ def main():
                 print_log(LogLevel.SUCCESS,
                           f"Cycle {cycle_count} start KRW(WS): {int(cycle_start_krw):,}")
 
-                drop_count = 6
+                drop_count = 7
 
                 # 신규 사이클 시작 비프만 (while 종료마다 울리면 연속 비프/재진입처럼 보임)
                 if not resume_skip_l1:
@@ -8730,7 +10552,18 @@ def main():
                             sell_base_price=avg_use, force_replace=False,
                             volume_hint=vol,
                             avg_refresh=True)
-                        if ok and sell_controller._open_sell_count() > 0:
+                        if not (ok and sell_controller._open_sell_count() > 0):
+                            if sell_controller._adopt_open_ask_tracking(symbol):
+                                ok = True
+                            elif str(getattr(sell_controller, '_last_sell_skip', '') or '') in (
+                                    'busy', 'cooldown', 'placing'):
+                                return
+                            else:
+                                ok = sell_controller._force_full_sell(
+                                    symbol, profit_targets, dynamic_buyer, vol,
+                                    base=avg_use, min_interval=1.0)
+                        if ok and (sell_controller._open_sell_count() > 0
+                                   or sell_controller._adopt_open_ask_tracking(symbol)):
                             sell_controller._sell_base_provisional = is_local
                             if not is_local:
                                 sell_controller._last_server_avg_seen = float(avg_use)
@@ -8741,18 +10574,34 @@ def main():
                             sell_controller._sell_placed_at_buy_count = (
                                 dynamic_buyer.executed_count)
                         else:
-                            print_log(LogLevel.WARNING,
-                                      f"매도 POST 미확인 — avg-sell 재arm "
-                                      f"(avg={avg_use:,.4f} vol={vol:.8f})")
+                            skip = str(getattr(sell_controller, '_last_sell_skip', '') or '')
+                            if skip in ('busy', 'cooldown', 'placing'):
+                                return
+                            if sell_controller.has_open_sell_orders():
+                                trading_manager.mark_sell_orders_placed()
+                                return
                             try:
-                                private_ws.arm_avg_sell(vol_hint=vol)
+                                bal, loc, _ = private_ws.get_symbol_info(symbol)
+                                held = max(float(bal or 0), 0) + max(float(loc or 0), 0)
+                            except Exception:
+                                held = 0.0
+                            re_vol = held if held >= MIN_HOLDING_VOLUME else float(vol)
+                            now_l = time.time()
+                            last_l = float(getattr(sell_controller, '_last_rearm_log_t', 0) or 0)
+                            if now_l - last_l >= 5.0:
+                                sell_controller._last_rearm_log_t = now_l
+                                print_log(LogLevel.WARNING,
+                                          f"전량매도 미확인 — 재arm "
+                                          f"(avg={avg_use:,.4f} vol={re_vol:.8f})")
+                            try:
+                                private_ws.arm_avg_sell(vol_hint=re_vol, symbol=symbol)
                             except Exception:
                                 pass
 
                     dynamic_buyer.on_buy_fill_sell = _on_buy_fill_sell
                     private_ws.set_avg_sell_target(symbol, _on_buy_fill_sell)
                     
-                    from laissez_faire.parallel import run_managed_cycle
+                    from .parallel import run_managed_cycle
                     print_log(LogLevel.SUCCESS,
                               "=== PARALLEL MODULES: market|command|buy|sell ===")
                     _ctx = run_managed_cycle(
